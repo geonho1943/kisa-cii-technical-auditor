@@ -15,9 +15,8 @@ fi
 declare -A AUDIT_CONFIG=(
     [output_dir]="./audit-results"          # 실행마다 권한이 제한된 하위 폴더 생성
     [check_ids]="ALL"                      # ALL 또는 U-01,U-18처럼 쉼표로 구분
-    [command_timeout_seconds]="15"         # 명령별 제한 시간: 1~3600초
-    [scan_timeout_seconds]="180"           # 항목·파일 탐색 제한 시간: 1~86400초
-    [scan_max_entries]="200000"            # 탐색 최대 항목 수: 1~10000000, 초과 시 미완료
+    [command_timeout_seconds]="15"         # 네트워크·서비스 조회 명령의 timeout: 1~3600초
+    [approved_log_accounts]=""            # /var/log 소유자로 승인한 추가 계정; root는 기본 허용
     [scan_roots]="AUTO"                    # AUTO=로컬 Mount; 직접 지정 시 절대 경로를 줄바꿈 구분
     [approved_accounts]=""                # 승인 계정; 계정·그룹·서비스 목록은 쉼표/줄바꿈 구분
     [approved_admin_accounts]=""          # 관리자 그룹에 허용한 계정
@@ -120,7 +119,6 @@ CIIP_CATALOG_2026_EOF
 # shellcheck shell=bash
 # All paths and commands are data. Never eval target configuration.
 AUDIT_VERSION=0.2.0
-AUDIT_ITEM_DEADLINE=0
 AUDIT_SYSTEMCTL_AVAILABLE=0
 AUDIT_NEED_ACCOUNTS=0
 AUDIT_NEED_GROUPS=0
@@ -128,6 +126,8 @@ AUDIT_NEED_SHADOW=0
 declare -A AUDIT_REQUIRED_ROLES=()
 AUDIT_WORK_DIR=
 AUDIT_OUTPUT_DIR=
+AUDIT_OUTPUT_BASE=
+declare -a FIND_PRUNE=()
 AUDIT_INTERRUPTED=0
 declare -A AUDIT_CATALOG_TITLE=() AUDIT_CATALOG_SEVERITY=()
 declare -A AUDIT_CATALOG_PURPOSE=() AUDIT_CATALOG_RISK=() AUDIT_CATALOG_PAGE=()
@@ -144,11 +144,11 @@ AUDIT_PACKAGE_DATA=
 AUDIT_PACKAGE_MANAGER=unknown
 AUDIT_PACKAGE_COMPLETE=0
 AUDIT_SCAN_SCOPE=unknown
-AUDIT_SCAN_COUNT=0
-declare -a AUDIT_SCAN_ROOTS=()
-declare -A AUDIT_SCAN_SELECTED=() AUDIT_SCAN_ITEM_COMPLETE=() AUDIT_SCAN_ITEM_CAPPED=()
-declare -A AUDIT_SCAN_ITEM_COUNT=() AUDIT_SCAN_ITEM_UNAPPROVED=() AUDIT_SCAN_ITEM_ERROR=()
-declare -A AUDIT_UID_KNOWN=() AUDIT_SERVICE_STATE=() AUDIT_SERVICE_EVIDENCE=()
+declare -a AUDIT_SCAN_ROOTS=() AUDIT_MOUNTS=()
+AUDIT_FIND_PRINTF=-1
+AUDIT_SCAN_ROOT_ERROR=
+declare -A AUDIT_SCAN_SELECTED=() AUDIT_SCAN_ITEM_COUNT=() AUDIT_SCAN_ITEM_UNAPPROVED=() AUDIT_SCAN_ITEM_ERROR=()
+declare -A AUDIT_ACCOUNT_UID=() AUDIT_SERVICE_STATE=() AUDIT_SERVICE_EVIDENCE=()
 PAM_ROWS=
 PAM_ERROR=
 declare -A PAM_VISITED=()
@@ -190,109 +190,48 @@ target_path() {
     printf '%s' "$1"
 }
 
-audit_within_deadline() {
-    ((AUDIT_INTERRUPTED == 0 && (AUDIT_ITEM_DEADLINE == 0 || SECONDS < AUDIT_ITEM_DEADLINE)))
-}
 
-kill_descendants() {
-    local parent=$1 child
-    command -v ps >/dev/null 2>&1 || return 0
-    while read -r child; do
-        [[ $child =~ ^[0-9]+$ ]] || continue
-        kill_descendants "$child"
-        kill -TERM "$child" 2>/dev/null || :
-    done < <(ps -eo pid=,ppid= 2>/dev/null | awk -v p="$parent" '$2==p {print $1}')
-}
+
+
 
 audit_cleanup() {
-    local pid
-    while read -r pid; do
-        [[ $pid =~ ^[0-9]+$ ]] || continue
-        kill_descendants "$pid"
-        kill -TERM "$pid" 2>/dev/null || :
-        wait "$pid" 2>/dev/null || :
-    done < <(jobs -pr)
-    if [[ -n $AUDIT_WORK_DIR && -d $AUDIT_WORK_DIR ]]; then rm -rf -- "$AUDIT_WORK_DIR"; fi
+    [[ -z $AUDIT_WORK_DIR || ! -d $AUDIT_WORK_DIR ]] || rm -rf -- "$AUDIT_WORK_DIR"
 }
 
-capture_file() {
-    # Args: stdout path, stderr path, seconds, file-limit blocks, command...
-    local out=$1 err=$2 budget=$3 limit_blocks=$4 remaining
-    shift 4
-    if ((AUDIT_ITEM_DEADLINE > 0)); then
-        remaining=$((AUDIT_ITEM_DEADLINE - SECONDS))
-        if ((remaining <= 0)); then
-            : >"$out"
-            printf '%s\n' 'item time budget exhausted' >"$err"
-            return 124
-        fi
-        ((remaining < budget)) && budget=$remaining
-    fi
-    (
-        # Bound stdout and stderr on disk as well as the later in-memory read.
-        ulimit -f "$limit_blocks" || exit 125
-        local code=0 pid watch marker="$AUDIT_WORK_DIR/capture.$BASHPID.$RANDOM.timeout"
-        if command -v timeout >/dev/null 2>&1; then
-            timeout -k 2 "$budget" "$@" >"$out" 2>"$err" || code=$?
-        else
-            "$@" >"$out" 2>"$err" &
-            pid=$!
-            (
-                sleep "$budget"
-                if kill -0 "$pid" 2>/dev/null; then
-                    : >"$marker"
-                    kill_descendants "$pid"
-                    kill -TERM "$pid" 2>/dev/null || :
-                    sleep 2
-                    kill -KILL "$pid" 2>/dev/null || :
-                fi
-            ) &
-            watch=$!
-            wait "$pid" || code=$?
-            kill_descendants "$watch"
-            kill -TERM "$watch" 2>/dev/null || :
-            wait "$watch" 2>/dev/null || :
-            [[ -f $marker ]] && code=124
-        fi
-        rm -f -- "$marker"
-        exit "$code"
-    )
-}
+
 
 capture_command() {
-    # Returns command status; replaces AUDIT_COMMAND_STDOUT/STDERR/RC.
-    local budget=$1
+    # 기존 인자(seconds, command...)와 stdout/stderr/rc 계약을 유지한다.
+    local budget=$1 code=0 err="$AUDIT_WORK_DIR/cmd.$BASHPID.err" command
     shift
-    local code=0 out="$AUDIT_WORK_DIR/cmd.$BASHPID.out" err="$AUDIT_WORK_DIR/cmd.$BASHPID.err"
-    capture_file "$out" "$err" "$budget" 512 "$@" || code=$?
-    AUDIT_COMMAND_STDOUT=$(head -c 262144 -- "$out" 2>/dev/null)
-    AUDIT_COMMAND_STDERR=$(head -c 8192 -- "$err" 2>/dev/null)
-    if [[ $(wc -c <"$out") -gt 262144 ]]; then
-        code=125
-        AUDIT_COMMAND_STDERR+=' output exceeds collector limit'
-    fi
+    command=${1##*/}
+    local -a run=("$@")
+    case $command in
+        getent|ss|netstat|systemctl|chronyc|ntpq|named-checkconf|nft|iptables-save|ip6tables-save|ufw|firewall-cmd|postconf|timedatectl)
+            command -v timeout >/dev/null 2>&1 && run=(timeout "$budget" "$@") ;;
+        sshd)
+            [[ ${2-} != -T ]] || { command -v timeout >/dev/null 2>&1 && run=(timeout "$budget" "$@"); } ;;
+    esac
+    AUDIT_COMMAND_STDOUT=$("${run[@]}" 2>"$err") || code=$?
+    AUDIT_COMMAND_STDERR=$(<"$err")
     AUDIT_COMMAND_RC=$code
-    rm -f -- "$out" "$err"
-    record_value "$1" exit_code "$code"
-    ((code == 0)) || record_value "$1" stderr "$AUDIT_COMMAND_STDERR" ERROR
+    rm -f -- "$err"
+    record_value "$command" exit_code "$code"
+    ((code == 0)) || record_value "$command" stderr "$AUDIT_COMMAND_STDERR" ERROR
     return "$code"
 }
 
 read_target() {
-    local file text code=0 err="$AUDIT_WORK_DIR/read.$BASHPID.$RANDOM.err"
+    local file text code=0 err="$AUDIT_WORK_DIR/read.$BASHPID.err"
     file=$(target_path "$1") || return 2
     if [[ ! -f $file || ! -r $file ]]; then
         record_value "$file" read '파일 없음 또는 읽기 불가' ERROR
         return 2
     fi
-    # Read through a pipe, never a plaintext temporary copy of the config.
-    text=$(capture_file /dev/stdout "$err" "${AUDIT_CONFIG[command_timeout_seconds]}" 512 head -c 262145 -- "$file") || code=$?
+    text=$(cat -- "$file" 2>"$err") || code=$?
+    if ((code)); then record_value "$file" read "조회 실패: $(<"$err")" ERROR; fi
     rm -f -- "$err"
-    if ((code != 0 || ${#text} > 262144)); then
-        ((code != 0)) || code=125
-        record_value "$file" read_exit_code "$code" ERROR
-        return "$code"
-    fi
+    ((code == 0)) || return "$code"
     printf '%s' "$text"
 }
 
@@ -355,24 +294,26 @@ mode_within() {
 }
 
 collect_paths() {
-    local destination=$1 root
-    shift
-    root=$1
-    shift
-    # Shares the configured entry ceiling and the 16 MiB file limit.
-    capture_file "$destination" "$destination.err" "${AUDIT_CONFIG[scan_timeout_seconds]}" 16384 \
-        "$BASH" --noprofile --norc -c '
-            set -o pipefail
-            limit=$1; shift
-            find "$@" | {
-                count=0
-                while IFS= read -r -d "" record; do
-                    ((count += 1))
-                    ((count <= limit)) || exit 125
-                    printf "%s\0" "$record"
-                done
-            }
-        ' -- "${AUDIT_CONFIG[scan_max_entries]}" "$root" -xdev "$@"
+    # /dev 직접 점검(U-26)을 포함한다. 전체 탐색의 prune은 별도로 구성한다.
+    local destination=$1 root=$2
+    shift 2
+    find "$root" -xdev "$@" >"$destination" 2>"$destination.err"
+}
+
+list_has_line() {
+    local value
+    while IFS= read -r value || [[ -n $value ]]; do
+        [[ $value == "$2" ]] && return 0
+    done <<<"${1-}"
+    return 1
+}
+
+find_printf_available() {
+    if ((AUDIT_FIND_PRINTF < 0)); then
+        AUDIT_FIND_PRINTF=0
+        find /dev/null -maxdepth 0 -printf '' >/dev/null 2>&1 && AUDIT_FIND_PRINTF=1
+    fi
+    ((AUDIT_FIND_PRINTF))
 }
 
 load_catalog() {
@@ -400,7 +341,7 @@ select_collectors() {
     local id role roles
     for id in "${AUDIT_SELECTED[@]}"; do
         case $id in
-        U-02 | U-03 | U-04 | U-05 | U-06 | U-07 | U-08 | U-09 | U-10 | U-11 | U-15 | U-21 | U-22 | U-24 | U-27 | U-31 | U-32 | U-55)
+        U-02 | U-03 | U-04 | U-05 | U-06 | U-07 | U-08 | U-09 | U-10 | U-11 | U-15 | U-21 | U-22 | U-24 | U-27 | U-31 | U-32 | U-37 | U-55 | U-67)
             AUDIT_NEED_ACCOUNTS=1 ;;
         esac
         case $id in U-08 | U-09) AUDIT_NEED_GROUPS=1 ;; esac
@@ -408,6 +349,7 @@ select_collectors() {
         roles=
         case $id in
         U-01) roles='ssh telnet r' ;;
+        U-62) roles='ssh telnet ftp mail dns' ;;
         U-27 | U-36) roles=r ;;
         U-34) roles=finger ;;
         U-35) roles='ftp nfs samba' ;;
@@ -440,7 +382,7 @@ service_definition() {
         SERVICE_PACKAGES=$packages
         return 0
     done <<'CIIP_SERVICES_EOF'
-ssh|sshd ssh dropbear|sshd dropbear|22|openssh-server dropbear
+ssh|sshd ssh ssh.socket sshd.socket dropbear|sshd dropbear|22|openssh-server dropbear
 telnet|telnet.socket telnet|telnetd in.telnetd|23|telnetd telnet-server inetutils-telnetd
 ftp|vsftpd proftpd pure-ftpd ftpd|vsftpd proftpd pure-ftpd ftpd|21|vsftpd proftpd pure-ftpd
 nfs|nfs-server nfs-kernel-server nfs|nfsd rpc.nfsd|2049|nfs-kernel-server nfs-utils
@@ -567,7 +509,7 @@ service_collect() {
 }
 
 platform_collect() {
-    local file id version name role output start=$SECONDS
+    local file id version name role output
     id=$(config_value /etc/os-release ID 2>/dev/null) || id=unknown
     version=$(config_value /etc/os-release VERSION_ID 2>/dev/null) || version=unknown
     id=${id//\"/}
@@ -589,10 +531,6 @@ platform_collect() {
         output=
         AUDIT_PROCESS_COMPLETE=1
         for file in /proc/[0-9]*/comm; do
-            if ((SECONDS - start >= ${AUDIT_CONFIG[command_timeout_seconds]})); then
-                AUDIT_PROCESS_COMPLETE=0
-                break
-            fi
             [[ -e $file ]] || continue
             if IFS= read -r name <"$file" 2>/dev/null; then
                 output+="$name"$'\n'
@@ -622,6 +560,9 @@ platform_collect() {
         AUDIT_PACKAGE_MANAGER=$name
         AUDIT_PACKAGE_COMPLETE=1
         AUDIT_PACKAGE_DATA=$AUDIT_COMMAND_STDOUT
+        if [[ $name == dpkg-query ]]; then
+            AUDIT_PACKAGE_DATA=$(awk '$1=="installed"' <<<"$AUDIT_PACKAGE_DATA")
+        fi
         break
     done
     if command -v systemctl >/dev/null 2>&1 && capture_command "${AUDIT_CONFIG[command_timeout_seconds]}" systemctl show --property=Version; then
@@ -634,19 +575,19 @@ platform_collect() {
 }
 
 account_collect() {
-    local file line uid rows code state algorithm min max last raw_min raw_max name
+    local file line uid rows code state algorithm min max last raw_min raw_max name nss_provider sssd_checked=0
     if ((AUDIT_NEED_ACCOUNTS)); then
         file=/etc/passwd
-        if [[ -r $file ]] && awk -F: 'NF!=7 || $1=="" || $3!~/^[0-9]+$/ || $4!~/^[0-9]+$/ {bad=1} END{exit bad}' "$file"; then
-            AUDIT_ACCOUNT_ROWS=$(awk -F: 'BEGIN{OFS=":"}{print $1,$3,$4,$6,$7}' "$file")
+        if [[ -r $file ]] && awk -F: '/^[+-]/ {next} NF!=7 || $1=="" || $3!~/^[0-9]+$/ || $4!~/^[0-9]+$/ {bad=1} END{exit bad}' "$file"; then
+            AUDIT_ACCOUNT_ROWS=$(awk -F: 'BEGIN{OFS=":"} !/^[+-]/{print $1,$3,$4,$6,$7}' "$file")
             [[ -n $AUDIT_ACCOUNT_ROWS ]] && AUDIT_ACCOUNTS_OK=1
-            while IFS=: read -r _ uid _; do [[ $uid =~ ^[0-9]+$ ]] && AUDIT_UID_KNOWN[$uid]=1; done <<<"$AUDIT_ACCOUNT_ROWS"
+            while IFS=: read -r name uid _; do [[ $uid =~ ^[0-9]+$ ]] && AUDIT_ACCOUNT_UID[$name]=$uid; done <<<"$AUDIT_ACCOUNT_ROWS"
         fi
     fi
     if ((AUDIT_NEED_GROUPS)); then
         file=/etc/group
-        if [[ -r $file ]] && awk -F: 'NF!=4 || $3!~/^[0-9]+$/ {bad=1} END{exit bad}' "$file"; then
-            AUDIT_GROUP_ROWS=$(awk -F: 'BEGIN{OFS=":"}{print $1,$3,$4}' "$file")
+        if [[ -r $file ]] && awk -F: '/^[+-]/ {next} NF!=4 || $3!~/^[0-9]+$/ {bad=1} END{exit bad}' "$file"; then
+            AUDIT_GROUP_ROWS=$(awk -F: 'BEGIN{OFS=":"} !/^[+-]/{print $1,$3,$4}' "$file")
             AUDIT_GROUPS_OK=1
         fi
     fi
@@ -654,6 +595,7 @@ account_collect() {
         file=/etc/shadow
         if [[ -r $file ]]; then
             rows=$(awk -F: '
+              /^[+-]/ {next}
               NF!=9 {bad=1;next}
               {state="HASH";alg="unknown";hash=$2
                if(hash=="")state="EMPTY";else if(hash~/^[!*]/)state="LOCKED"
@@ -675,9 +617,25 @@ account_collect() {
         fi
     fi
     if ((AUDIT_NEED_ACCOUNTS || AUDIT_NEED_GROUPS || AUDIT_NEED_SHADOW)); then
-        line=$(active_lines /etc/nsswitch.conf 2>/dev/null | awk '/^(passwd|group|shadow):/ {print}') || :
+        line=$(active_lines /etc/nsswitch.conf 2>/dev/null | awk '{sub(/#.*/,"")} /^[[:space:]]*(passwd|group|shadow):/ {print}') || :
         AUDIT_NSS_EVIDENCE=$line
-        if grep -Eq '(ldap|sss|nis|winbind|compat)' <<<"$line"; then AUDIT_NSS_EXTERNAL=1; fi
+        for nss_provider in $line; do
+            case $nss_provider in
+                ldap|nis|nisplus|winbind) AUDIT_NSS_EXTERNAL=1 ;;
+                sss)
+                    ((sssd_checked)) && continue
+                    sssd_checked=1
+                    if [[ -f /etc/sssd/sssd.conf ]]; then
+                        AUDIT_NSS_EXTERNAL=1
+                        AUDIT_NSS_EVIDENCE+=$'\n''/etc/sssd/sssd.conf exists:yes'
+                    elif command -v systemctl >/dev/null 2>&1; then
+                        capture_command "${AUDIT_CONFIG[command_timeout_seconds]}" systemctl is-active sssd || :
+                        AUDIT_NSS_EVIDENCE+=$'\n'"sssd config_exists:no ActiveState:$AUDIT_COMMAND_STDOUT query_rc:$AUDIT_COMMAND_RC"
+                        [[ $AUDIT_COMMAND_RC != 0 || $AUDIT_COMMAND_STDOUT != active ]] || AUDIT_NSS_EXTERNAL=1
+                    else AUDIT_NSS_EVIDENCE+=$'\n''sssd config_exists:no service_query:도구 없음'; fi ;;
+                compat) if grep -q '^+' /etc/passwd; then AUDIT_NSS_EXTERNAL=1; fi ;;
+            esac
+        done
     fi
     return 0
 }
@@ -685,7 +643,7 @@ account_collect() {
 record_accounts() {
     local name uid gid home shell members state algorithm min max last
     case $AUDIT_CURRENT_ID in
-    U-02|U-03|U-04|U-05|U-06|U-07|U-08|U-09|U-10|U-11|U-15|U-21|U-22|U-24|U-27|U-31|U-32|U-55)
+    U-02|U-03|U-04|U-05|U-06|U-07|U-08|U-09|U-10|U-11|U-15|U-21|U-22|U-24|U-27|U-31|U-32|U-37|U-55|U-67)
         record_value /etc/passwd collection_ok "$AUDIT_ACCOUNTS_OK"
         while IFS=: read -r name uid gid home shell; do
             [[ -n $name ]] && record_value "/etc/passwd:$name" account "uid:$uid gid:$gid home:$home shell:$shell"
@@ -719,17 +677,8 @@ scan_find_pattern() {
     printf '%s' "$value"
 }
 
-scan_incomplete() {
-    local reason=$1 capped=${2:-0} only=${3:-} kind
-    for kind in "${!AUDIT_SCAN_SELECTED[@]}"; do
-        [[ -z $only || $kind == "$only" ]] || continue
-        AUDIT_SCAN_ITEM_COMPLETE[$kind]=0
-        ((capped)) && AUDIT_SCAN_ITEM_CAPPED[$kind]=1
-        if [[ ${AUDIT_SCAN_ITEM_ERROR[$kind]-} != *"$reason"* ]]; then
-            AUDIT_SCAN_ITEM_ERROR[$kind]="${AUDIT_SCAN_ITEM_ERROR[$kind]-}$reason; "
-            AUDIT_SCAN_ITEM_ERROR[$kind]=${AUDIT_SCAN_ITEM_ERROR[$kind]:0:1500}
-        fi
-    done
+scan_scope_error() {
+    AUDIT_SCAN_ROOT_ERROR+="$1; "
 }
 
 scan_record() {
@@ -739,87 +688,14 @@ scan_record() {
     record_value "$@"
 }
 
-scan_add_finding() {
-    local kind=$1 approved=${3:-0} count=${4:-1} detail=${5:-$2}
-    scan_record "$kind" "$2" finding "$detail"
-    [[ $kind == AUDIT_ORPHANS ]] || scan_record "$kind" "$2" approved "$approved"
-    ((AUDIT_SCAN_ITEM_COUNT[$kind] += count))
-    ((approved)) || ((AUDIT_SCAN_ITEM_UNAPPROVED[$kind] += count))
-    return 0
-}
 
-scan_resolve_uids() {
-    local -n counts=$1 paths=$2
-    local deadline=$3 uid remaining budget unresolved=0 capped=0 owner returned_uid
-    for uid in "${!counts[@]}"; do
-        if [[ ! -v AUDIT_UID_KNOWN[$uid] ]]; then
-            remaining=$((deadline - SECONDS))
-            if ((remaining <= 0)); then capped=1; break; fi
-            command -v getent >/dev/null 2>&1 || break
-            budget=${AUDIT_CONFIG[command_timeout_seconds]}
-            ((budget <= remaining)) || budget=$remaining
-            if capture_command "$budget" getent passwd "$uid"; then
-                IFS=: read -r owner _ returned_uid _ <<<"$AUDIT_COMMAND_STDOUT"
-                scan_record AUDIT_ORPHANS "NSS:$uid" passwd_identity "name:$owner uid:$returned_uid"
-                AUDIT_UID_KNOWN[$uid]=1
-            elif ((AUDIT_COMMAND_RC == 2)); then AUDIT_UID_KNOWN[$uid]=0
-            else scan_record AUDIT_ORPHANS "NSS:$uid" lookup_rc "$AUDIT_COMMAND_RC" ERROR; continue; fi
-        fi
-        scan_record AUDIT_ORPHANS "NSS:$uid" account_exists "${AUDIT_UID_KNOWN[$uid]}"
-        scan_record AUDIT_ORPHANS "NSS:$uid" matching_files "${counts[$uid]}"
-        if [[ ${AUDIT_UID_KNOWN[$uid]} == 0 ]]; then
-            scan_add_finding AUDIT_ORPHANS "${paths[$uid]}" 0 "${counts[$uid]}" \
-                "${paths[$uid]} uid=$uid matching_files=${counts[$uid]} (UID별 대표 경로)"
-        fi
-        unset "counts[$uid]" "paths[$uid]"
-    done
-    for uid in "${!counts[@]}"; do ((unresolved += counts[$uid])); done
-    if ((unresolved)); then
-        scan_incomplete "UID/NSS 미확인: uids=${#counts[@]} files=$unresolved" "$capped" AUDIT_ORPHANS
-    fi
-}
 
-scan_collect() {
-    local deadline=$((SECONDS + ${AUDIT_CONFIG[scan_timeout_seconds]}))
-    local entry_limit=${AUDIT_CONFIG[scan_max_entries]} mount_limit=1024 uid_limit=1024 approval_limit=200000
-    local has_printf=0 needs_metadata=0 uid_overflow=0
-    local spec id kind policy path root fs dev backing rest
-    local old_root old_dev old_backing source shadow covered index remaining fd pid rc stopped
-    local status_file error_file record uid gid mode type value query_budget
-    local -a all_mounts=() candidate_paths=() candidate_devs=() candidate_roots=()
-    local -a kept_devs=() kept_roots=() args=() filters=()
-    local -A scan_approved=() seen_mounts=() uid_counts=() uid_paths=()
-    # This collector runs once; its result arrays are initialized with script state.
-    for spec in U-15:AUDIT_ORPHANS: U-23:AUDIT_SPECIAL_FILES:approved_special_files \
-        U-25:AUDIT_WORLD_FILES:approved_world_writable_paths U-33:AUDIT_HIDDEN_FILES:approved_hidden_paths; do
-        IFS=: read -r id kind policy <<<"$spec"
-        if [[ ${AUDIT_CONFIG[check_ids]} == ALL ]] || list_has "${AUDIT_CONFIG[check_ids]}" "$id"; then
-            AUDIT_SCAN_SELECTED[$kind]=$id
-            [[ $kind == AUDIT_HIDDEN_FILES ]] || needs_metadata=1
-            AUDIT_SCAN_ITEM_COMPLETE[$kind]=1
-            AUDIT_SCAN_ITEM_CAPPED[$kind]=0
-            AUDIT_SCAN_ITEM_COUNT[$kind]=0
-            AUDIT_SCAN_ITEM_UNAPPROVED[$kind]=0
-            AUDIT_SCAN_ITEM_ERROR[$kind]=
-            if [[ -n $policy ]]; then
-                scan_record "$kind" policy "$policy" "${AUDIT_CONFIG[$policy]}"
-                index=0
-                while IFS= read -r path || [[ -n $path ]]; do
-                    [[ -n $path ]] || continue
-                    ((index += 1))
-                    if ((index > approval_limit)); then
-                        scan_incomplete '승인 목록 크기 제한' 1 "$kind"
-                        break
-                    fi
-                    scan_approved["$kind|$path"]=1
-                done <<<"${AUDIT_CONFIG[$policy]}"
-            fi
-        fi
-    done
-    if ((${#AUDIT_SCAN_SELECTED[@]} == 0)); then
-        AUDIT_SCAN_SCOPE='파일 탐색 항목 미선택'
-        return
-    fi
+
+
+scan_collect_roots() {
+    local path root fs dev backing rest value index old_root old_dev old_backing source shadow covered
+    local -a candidate_paths=() candidate_devs=() candidate_roots=() kept_devs=() kept_roots=()
+    local -A seen_mounts=()
     if [[ ${AUDIT_CONFIG[scan_roots]} == AUTO ]]; then
         AUDIT_SCAN_SCOPE='AUTO: 현재 Mount Namespace의 로컬 파일시스템; bind 별칭 중복 제외'
     else
@@ -827,31 +703,25 @@ scan_collect() {
     fi
     # Prune every submount; only known local filesystems enter AUTO scope.
     if [[ -r /proc/self/mountinfo ]]; then
-        index=0
         while read -r _ _ dev backing path _ rest; do
-            ((index += 1))
-            if ((index > mount_limit || SECONDS >= deadline)); then
-                scan_incomplete 'Mount 목록 크기 또는 시간 제한' 1
-                break
-            fi
             printf -v path '%b' "$path"
             printf -v backing '%b' "$backing"
-            all_mounts+=("$path")
-            case $rest in '- '*) value=${rest#'- '} ;; *' - '*) value=${rest#*' - '} ;; *) scan_incomplete 'Mount 정보 해석 실패'; continue ;; esac
+            AUDIT_MOUNTS+=("$path")
+            case $rest in '- '*) value=${rest#'- '} ;; *' - '*) value=${rest#*' - '} ;; *) scan_scope_error 'Mount 정보 해석 실패'; continue ;; esac
             fs=${value%% *}
             [[ ${AUDIT_CONFIG[scan_roots]} == AUTO ]] || continue
             case $path in /dev | /dev/* | /proc | /proc/* | /sys | /sys/*) continue ;; esac
             case $fs in
                 ext2 | ext3 | ext4 | xfs | btrfs | zfs | f2fs | jfs | reiserfs | reiser4 | nilfs2 | vfat | msdos | exfat | ntfs | ntfs3 | fuseblk | overlay | aufs | tmpfs | ramfs | squashfs | erofs | iso9660 | udf) ;;
                 proc | sysfs | devtmpfs | devpts | cgroup | cgroup2 | securityfs | debugfs | tracefs | pstore | mqueue | hugetlbfs | nfs | nfs4 | cifs | smb3 | fuse | fuse.* | autofs | rpc_pipefs | binfmt_misc | configfs | 9p | ceph | glusterfs | lustre | afs | nsfs | bpf | efivarfs | selinuxfs | smackfs | fusectl) continue ;;
-                *) scan_incomplete "미확인 파일시스템 제외:$fs"; continue ;;
+                *) scan_scope_error "미확인 파일시스템 제외:$fs"; continue ;;
             esac
             candidate_paths+=("$path")
             candidate_devs+=("$dev")
             candidate_roots+=("$backing")
         done </proc/self/mountinfo
     else
-        scan_incomplete 'Mount 목록을 읽지 못해 하위 Mount 제외를 보장하지 못함'
+        scan_scope_error 'Mount 목록을 읽지 못해 하위 Mount 제외를 보장하지 못함'
         [[ ${AUDIT_CONFIG[scan_roots]} == AUTO ]] && candidate_paths=(/)
     fi
     if [[ ${AUDIT_CONFIG[scan_roots]} != AUTO ]]; then
@@ -859,7 +729,7 @@ scan_collect() {
         while IFS= read -r root || [[ -n $root ]]; do
             [[ -n $root ]] || continue
             if [[ $root != /* || $root == *$'\n'* || $root == *'/../'* || $root == */.. ]]; then
-                scan_incomplete '탐색 경로는 정규화 가능한 절대 경로여야 함'
+                scan_scope_error '탐색 경로는 정규화 가능한 절대 경로여야 함'
                 continue
             fi
             candidate_paths+=("$root")
@@ -868,7 +738,6 @@ scan_collect() {
     # A previous mount with the same device and a parent backing root covers a
     # bind alias only when its original path remains reachable (no overmount).
     for ((index=0; index<${#candidate_paths[@]}; index++)); do
-        if ((SECONDS >= deadline)); then scan_incomplete 'Mount 범위 처리 시간 제한' 1; break; fi
         root=${candidate_paths[$index]}
         dev=${candidate_devs[$index]-custom}
         backing=${candidate_roots[$index]-$root}
@@ -883,7 +752,7 @@ scan_collect() {
             value=${backing#"${old_backing%/}"}
             source="${AUDIT_SCAN_ROOTS[$old_root]%/}$value"
             shadow=0
-            for path in "${all_mounts[@]}"; do
+            for path in "${AUDIT_MOUNTS[@]}"; do
                 [[ $path == "${AUDIT_SCAN_ROOTS[$old_root]}" ]] && continue
                 [[ ${AUDIT_SCAN_ROOTS[$old_root]} == / || $path == "${AUDIT_SCAN_ROOTS[$old_root]%/}/"* ]] || continue
                 if [[ $source == "$path" || $source == "${path%/}/"* || $path == "${source%/}/"* ]]; then shadow=1; break; fi
@@ -895,125 +764,99 @@ scan_collect() {
         kept_devs+=("$dev")
         kept_roots+=("$backing")
     done
-    ((${#AUDIT_SCAN_ROOTS[@]})) || { scan_incomplete '유효한 로컬 Mount 없음'; return; }
-    if find /dev/null -maxdepth 0 -printf '' >/dev/null 2>&1; then has_printf=1; fi
-    if ((has_printf)) && [[ ! -v AUDIT_SCAN_SELECTED[AUDIT_ORPHANS] ]]; then
-        if [[ -v AUDIT_SCAN_SELECTED[AUDIT_SPECIAL_FILES] ]]; then filters+=(-type f '(' -perm -4000 -o -perm -2000 ')'); fi
-        if [[ -v AUDIT_SCAN_SELECTED[AUDIT_WORLD_FILES] ]]; then
-            ((${#filters[@]})) && filters+=(-o)
-            filters+=(-type f -perm -0002)
+    ((${#AUDIT_SCAN_ROOTS[@]})) || { scan_scope_error '유효한 로컬 Mount 없음'; return; }
+}
+
+find_prune_args() {
+    local root=$1 path
+    FIND_PRUNE=('(' -path "$(scan_find_pattern "$AUDIT_OUTPUT_BASE")")
+    for path in /proc /sys /dev "${AUDIT_MOUNTS[@]}"; do
+        if [[ $path != "$root" && ($root == / || $path == "${root%/}/"*) ]]; then
+            FIND_PRUNE+=(-o -path "$(scan_find_pattern "$path")")
         fi
-        if [[ -v AUDIT_SCAN_SELECTED[AUDIT_HIDDEN_FILES] ]]; then
-            ((${#filters[@]})) && filters+=(-o)
-            filters+=(-name '.*')
-        fi
-    fi
-    index=0
-    for root in "${AUDIT_SCAN_ROOTS[@]}"; do
-        remaining=$((deadline - SECONDS))
-        if ((remaining <= 0)); then scan_incomplete '파일 탐색 전체 시간 제한' 1; break; fi
-        query_budget=${AUDIT_CONFIG[command_timeout_seconds]}
-        ((query_budget <= remaining)) || query_budget=$remaining
-        if ! capture_command "$query_budget" readlink -f -- "$root"; then
-            scan_incomplete "탐색 경로 해석 실패:$root"
+    done
+    FIND_PRUNE+=(')' -prune -o)
+}
+
+scan_collect() {
+    local spec id kind policy root records rc record reason uid gid mode path previous approved
+    local -a filters=()
+    local -A approved_paths=()
+    for spec in U-15:AUDIT_ORPHANS: U-23:AUDIT_SPECIAL_FILES:approved_special_files \
+        U-25:AUDIT_WORLD_FILES:approved_world_writable_paths U-33:AUDIT_HIDDEN_FILES:approved_hidden_paths; do
+        IFS=: read -r id kind policy <<<"$spec"
+        [[ ${AUDIT_CONFIG[check_ids]} == ALL ]] || list_has "${AUDIT_CONFIG[check_ids]}" "$id" || continue
+        AUDIT_SCAN_SELECTED[$kind]=$id
+        AUDIT_SCAN_ITEM_COUNT[$kind]=0
+        AUDIT_SCAN_ITEM_UNAPPROVED[$kind]=0
+        AUDIT_SCAN_ITEM_ERROR[$kind]=
+    done
+    if ((${#AUDIT_SCAN_SELECTED[@]} == 0)); then AUDIT_SCAN_SCOPE='파일 탐색 항목 미선택'; return; fi
+    scan_collect_roots
+    for kind in "${!AUDIT_SCAN_SELECTED[@]}"; do
+        AUDIT_SCAN_ITEM_ERROR[$kind]=$AUDIT_SCAN_ROOT_ERROR
+        if ! find_printf_available; then
+            AUDIT_SCAN_ITEM_ERROR[$kind]+='UNSUPPORTED_FIND: GNU find -printf 필요'
             continue
         fi
-        root=$AUDIT_COMMAND_STDOUT
-        [[ $root == /* && -d $root ]] || { scan_incomplete "탐색 디렉터리 확인 실패:$root"; continue; }
-        args=("$root" -xdev '(' -path "$(scan_find_pattern "$AUDIT_OUTPUT_DIR")")
-        for path in /proc /sys /dev "${all_mounts[@]}"; do
-            if [[ $path != "$root" && ($root == / || $path == "${root%/}/"*) ]]; then
-                args+=(-o -path "$(scan_find_pattern "$path")")
-            fi
-        done
-        args+=(')' -prune -o)
-        ((${#filters[@]})) && args+=('(' "${filters[@]}" ')')
-        if ((has_printf && needs_metadata)); then args+=(-printf '%U:%G:%m:%y:%p\0')
-        elif ((has_printf)); then args+=(-printf '%p\0')
-        else args+=(-print0); fi
-        # Empty records count non-candidates without serializing their paths.
-        ((${#filters[@]})) && args+=(-o -printf '\0')
-        ((index += 1))
-        status_file="$AUDIT_WORK_DIR/scan.$index.status"
-        error_file="$AUDIT_WORK_DIR/scan.$index.err"
-        remaining=$((deadline - SECONDS))
-        if ((remaining <= 0)); then scan_incomplete '파일 탐색 전체 시간 제한' 1; break; fi
-        exec {fd}< <(capture_file /dev/stdout "$error_file" "$remaining" 16384 find "${args[@]}"; printf '%s' "$?" >"$status_file")
-        pid=$!
-        stopped=0
-        while :; do
-            remaining=$((deadline - SECONDS))
-            if ((remaining <= 0)); then scan_incomplete '파일 탐색 전체 시간 제한' 1; stopped=1; break; fi
-            record=
-            if ! IFS= read -r -d '' -t "$remaining" record <&"$fd"; then
-                [[ -z $record ]] || scan_incomplete '불완전한 파일 Metadata 레코드'
-                break
-            fi
-            if ((AUDIT_SCAN_COUNT >= entry_limit)); then scan_incomplete "전체 엔트리 ${entry_limit}개 제한" 1; stopped=1; break; fi
-            ((AUDIT_SCAN_COUNT += 1))
-            [[ -n $record ]] || continue
-            if ((has_printf && needs_metadata)); then
-                uid=${record%%:*}; record=${record#*:}
-                gid=${record%%:*}; record=${record#*:}
-                mode=${record%%:*}; record=${record#*:}
-                type=${record%%:*}; path=${record#*:}
-            else
-                path=$record
-            fi
-            if [[ -v AUDIT_SCAN_SELECTED[AUDIT_HIDDEN_FILES] && ${path##*/} == .* && ${path##*/} != . && ${path##*/} != .. ]]; then
-                scan_add_finding AUDIT_HIDDEN_FILES "$path" "${scan_approved["AUDIT_HIDDEN_FILES|$path"]-0}"
-            fi
-            ((needs_metadata)) || continue
-            if ((has_printf == 0)); then
-                remaining=$((deadline - SECONDS))
-                ((remaining > 0)) || { scan_incomplete '파일 Metadata 처리 시간 제한' 1; stopped=1; break; }
-                query_budget=${AUDIT_CONFIG[command_timeout_seconds]}
-                ((query_budget <= remaining)) || query_budget=$remaining
-                if capture_command "$query_budget" stat -c '%u:%g:%a:%F' -- "$path"; then
-                    IFS=: read -r uid gid mode type <<<"$AUDIT_COMMAND_STDOUT"
-                else
-                    for kind in AUDIT_ORPHANS AUDIT_SPECIAL_FILES AUDIT_WORLD_FILES; do
-                        [[ -v AUDIT_SCAN_SELECTED[$kind] ]] && scan_incomplete '일부 파일 Metadata 수집 실패' 0 "$kind"
-                    done
-                    continue
-                fi
-            fi
-            if [[ ! $uid =~ ^[0-9]+$ || ! $mode =~ ^[0-7]{1,4}$ ]]; then
-                for kind in AUDIT_ORPHANS AUDIT_SPECIAL_FILES AUDIT_WORLD_FILES; do
-                    [[ -v AUDIT_SCAN_SELECTED[$kind] ]] && scan_incomplete '파일 Metadata 해석 실패' 0 "$kind"
-                done
-                continue
-            fi
-            if [[ -v AUDIT_SCAN_SELECTED[AUDIT_ORPHANS] && ${AUDIT_UID_KNOWN[$uid]-0} != 1 ]]; then
-                scan_record AUDIT_ORPHANS "$path" owner_candidate "uid:$uid gid:$gid mode:$mode"
-                if [[ -v uid_counts[$uid] ]]; then
-                    ((uid_counts[$uid] += 1))
-                elif ((${#uid_counts[@]} < uid_limit)); then
-                    uid_counts[$uid]=1
-                    uid_paths[$uid]=$path
-                else ((uid_overflow += 1)); fi
-            fi
-            if [[ $type == f || $type == 'regular file' || $type == 'regular empty file' ]]; then
-                if [[ -v AUDIT_SCAN_SELECTED[AUDIT_SPECIAL_FILES] ]] && (((8#$mode & 06000) != 0)); then scan_add_finding AUDIT_SPECIAL_FILES "$path" "${scan_approved["AUDIT_SPECIAL_FILES|$path"]-0}" 1 "$path uid=$uid gid=$gid mode=$mode"; fi
-                if [[ -v AUDIT_SCAN_SELECTED[AUDIT_WORLD_FILES] ]] && (((8#$mode & 0002) != 0)); then scan_add_finding AUDIT_WORLD_FILES "$path" "${scan_approved["AUDIT_WORLD_FILES|$path"]-0}" 1 "$path uid=$uid gid=$gid mode=$mode"; fi
-            fi
-        done
-        exec {fd}<&-
-        if ((stopped)); then
-            kill_descendants "$pid"
-            kill -TERM "$pid" 2>/dev/null || :
+        policy=
+        case $kind in
+            AUDIT_ORPHANS)
+                # 한 파일에 소유 계정·그룹이 모두 없으면 두 이유를 각각 기록한다.
+                filters=('(' -nouser -printf 'nouser %U %G %m %p\0' ')' ',' '(' -nogroup -printf 'nogroup %U %G %m %p\0' ')') ;;
+            AUDIT_SPECIAL_FILES)
+                policy=approved_special_files
+                filters=(-type f '(' -perm -4000 -o -perm -2000 ')' -printf 'special %U %G %m %p\0') ;;
+            AUDIT_WORLD_FILES)
+                policy=approved_world_writable_paths
+                filters=(-type f -perm -0002 -printf 'world_writable %U %G %m %p\0') ;;
+            AUDIT_HIDDEN_FILES)
+                policy=approved_hidden_paths
+                filters=(-name '.*' -printf 'hidden %U %G %m %p\0') ;;
+        esac
+        approved_paths=()
+        if [[ -n $policy ]]; then
+            scan_record "$kind" policy "$policy" "${AUDIT_CONFIG[$policy]}"
+            while IFS= read -r path || [[ -n $path ]]; do
+                [[ -z $path ]] || approved_paths["$path"]=1
+            done <<<"${AUDIT_CONFIG[$policy]}"
         fi
-        wait "$pid" 2>/dev/null || :
-        rc=125
-        [[ -r $status_file ]] && IFS= read -r rc <"$status_file"
-        [[ $rc == 0 ]] || scan_incomplete "find 실패 또는 중단(rc=$rc)" "$([[ $rc == 124 || $rc == 137 ]] && printf 1 || printf 0)"
-        [[ ! -s $error_file ]] || scan_incomplete 'find 경로·권한 오류: 일부 범위 미수집'
-        rm -f -- "$status_file" "$error_file"
-        ((stopped)) && break
+        records="$AUDIT_WORK_DIR/find.${AUDIT_SCAN_SELECTED[$kind]}"
+        for root in "${AUDIT_SCAN_ROOTS[@]}"; do
+            ((AUDIT_INTERRUPTED == 0)) || break
+            if ! capture_command "${AUDIT_CONFIG[command_timeout_seconds]}" readlink -f -- "$root"; then
+                AUDIT_SCAN_ITEM_ERROR[$kind]+="경로 해석 실패:$root; "; continue
+            fi
+            root=$AUDIT_COMMAND_STDOUT
+            [[ -d $root ]] || { AUDIT_SCAN_ITEM_ERROR[$kind]+="디렉터리 없음:$root; "; continue; }
+            find_prune_args "$root"
+            rc=0
+            find "$root" -xdev "${FIND_PRUNE[@]}" '(' "${filters[@]}" ')' >"$records" 2>"$records.err" || rc=$?
+            scan_record "$kind" "$root" find_exit_code "$rc"
+            if ((rc)); then
+                AUDIT_SCAN_ITEM_ERROR[$kind]+="find 조회 실패:$root(rc=$rc); "
+                scan_record "$kind" "$root" find_stderr "$(<"$records.err")" ERROR
+            fi
+            previous=
+            while IFS= read -r -d '' record; do
+                reason=${record%% *}; record=${record#* }
+                uid=${record%% *}; record=${record#* }
+                gid=${record%% *}; record=${record#* }
+                mode=${record%% *}; path=${record#* }
+                if [[ ! $uid =~ ^[0-9]+$ || ! $gid =~ ^[0-9]+$ || ! $mode =~ ^[0-7]{1,4}$ || $path != /* ]]; then
+                    AUDIT_SCAN_ITEM_ERROR[$kind]+='Metadata 형식 오류; '; continue
+                fi
+                approved=${approved_paths[$path]:-0}
+                scan_record "$kind" "$path" "$reason" "uid:$uid gid:$gid mode:$mode approved:$approved"
+                if [[ $path != "$previous" ]]; then
+                    ((AUDIT_SCAN_ITEM_COUNT[$kind] += 1))
+                    ((approved)) || ((AUDIT_SCAN_ITEM_UNAPPROVED[$kind] += 1))
+                fi
+                previous=$path
+            done <"$records"
+            rm -f -- "$records" "$records.err"
+        done
     done
-    if ((uid_overflow)); then scan_incomplete "UID 후보 제한: 누락 파일=$uid_overflow" 1 AUDIT_ORPHANS; fi
-    # NSS runs after collection; one representative path per UID bounds memory.
-    scan_resolve_uids uid_counts uid_paths "$deadline"
 }
 
 # --- 판정 보조 — 입력과 확인된 근거를 해석 ---
@@ -1176,31 +1019,92 @@ check_file_rule() {
 # State is the caller's associative array: checked/errors/bad. Metadata failures
 # return 1; findings accumulate without changing the caller's result precedence.
 file_rule_add() {
-    local path=$1 allowed=$2 owners=$3
+    if ! file_metadata "$1"; then
+        local -n state=$4
+        state[errors]=1
+        return 1
+    fi
+    file_rule_compare "$@"
+}
+
+file_rule_compare() {
+    # Metadata는 호출자가 한 번 수집한다. 이 함수는 외부 명령을 호출하지 않는다.
+    local path=$1 allowed=$2 owners=$3 name
     local -n state=$4
     ((state[checked] += 1))
-    record_value "$path" allowed_mode "$allowed"
-    record_value "$path" allowed_uids "$owners"
-    if ! file_metadata "$path"; then state[errors]=1; return 1; fi
+    if [[ $AUDIT_CURRENT_ID == U-37 && $path == /var/spool/cron/* && $path != /var/spool/cron/atjobs/* ]]; then
+        name=${path##*/}
+        if [[ -v AUDIT_ACCOUNT_UID[$name] ]]; then owners="0,${AUDIT_ACCOUNT_UID[$name]}"
+        elif [[ $FILE_UID != 0 ]]; then
+            record_value "$path" account_mapping "name:$name local_uid:미발견" MISSING
+            if ((AUDIT_NSS_EXTERNAL)); then
+                state[manual]=1
+                owners="0,$FILE_UID"
+            fi
+        fi
+    fi
+    record_value "$path" metadata "uid:$FILE_UID gid:$FILE_GID mode:$FILE_MODE allowed_mode:$allowed allowed_uids:$owners"
     if ! list_has "$owners" "$FILE_UID" || ! mode_within "$FILE_MODE" "$allowed"; then
         ((${#state[bad]} >= 24000)) || state[bad]+="$path uid=$FILE_UID mode=$FILE_MODE"$'\n'
     fi
     return 0
 }
 
-file_rule_scan() {
-    local dir=$1 allowed=$2 owners=$3 path records="$AUDIT_WORK_DIR/permissions.$BASHPID"
+file_rule_read() {
+    local records=$1 allowed=$2 owners=$3 record type path
     local -n state=$4
-    local -a depth=()
-    [[ -d $dir ]] || { record_value "$dir" directory no MISSING; return 0; }
-    record_value "$dir" directory yes
-    record_value "$dir" maxdepth "${5:-전체 하위 경로}"
-    [[ -z ${5:-} ]] || depth=(-maxdepth "$5")
-    collect_paths "$records" "$dir" "${depth[@]}" -type f -print0 || state[errors]=1
-    while IFS= read -r -d '' path; do
-        audit_within_deadline || { state[errors]=1; break; }
-        file_rule_add "$path" "$allowed" "$owners" "$4" || :
+    while IFS= read -r -d '' record; do
+        type=${record%% *}; record=${record#* }
+        FILE_UID=${record%% *}; record=${record#* }
+        FILE_GID=${record%% *}; record=${record#* }
+        FILE_MODE=${record%% *}; path=${record#* }
+        if [[ $AUDIT_CURRENT_ID == U-24 ]]; then
+            case ${path##*/} in
+                .profile|.bash_profile|.bash_login|.bashrc|.bash_logout|.cshrc|.tcshrc|.zshrc|.zprofile|.kshrc|.login) ;;
+                *) continue ;;
+            esac
+        fi
+        if [[ $type != f || ! $FILE_UID =~ ^[0-9]+$ || ! $FILE_GID =~ ^[0-9]+$ || ! $FILE_MODE =~ ^[0-7]{1,4}$ ]]; then
+            record_value "$path" metadata '파일 대상 또는 Metadata 조회 실패' ERROR
+            state[errors]=1
+            continue
+        fi
+        file_rule_compare "$path" "$allowed" "$owners" "$4"
     done <"$records"
+}
+
+file_rule_scan() {
+    local dir=$1 allowed=$2 owners=$3 rc=0 records="$AUDIT_WORK_DIR/permissions.$BASHPID"
+    local -n state=$4
+    local -a options=() follow=(-P) types=(-type f)
+    [[ -d $dir ]] || { record_value "$dir" directory no MISSING; return 0; }
+    if ! find_printf_available; then
+        state[manual]=1; record_value "$dir" collector 'GNU find -printf 필요' MISSING; return 0
+    fi
+    [[ -z ${5:-} ]] || options=(-maxdepth "$5")
+    if [[ $AUDIT_CURRENT_ID == U-24 ]]; then
+        follow=(-L); options=(-maxdepth 1); types=(-name '.*' '(' -type f -o -type l ')')
+    fi
+    record_value "$dir" scope "maxdepth:${5:-전체} allowed_mode:$allowed allowed_uids:$owners"
+    find_prune_args "$dir"
+    find "${follow[@]}" "$dir" -xdev "${options[@]}" "${FIND_PRUNE[@]}" "${types[@]}" \
+        -printf '%y %U %G %m %p\0' >"$records" 2>"$records.err" || rc=$?
+    if ((rc)); then state[errors]=1; record_value "$dir" find_stderr "$(<"$records.err")" ERROR; fi
+    file_rule_read "$records" "$allowed" "$owners" "$4"
+    rm -f -- "$records" "$records.err"
+}
+
+file_rule_paths() {
+    local allowed=$1 owners=$2 state_name=$3 path rc=0 records="$AUDIT_WORK_DIR/permissions.$BASHPID"
+    local -n state=$3
+    shift 3
+    local -a paths=()
+    for path in "$@"; do path_exists "$path" && paths+=("$path"); done
+    ((${#paths[@]})) || return 0
+    if ! find_printf_available; then state[manual]=1; record_value find capability '-printf 미지원' MISSING; return 0; fi
+    find -H "${paths[@]}" -xdev -maxdepth 0 -printf '%y %U %G %m %p\0' >"$records" 2>"$records.err" || rc=$?
+    if ((rc)); then state[errors]=1; record_value find stderr "$(<"$records.err")" ERROR; fi
+    file_rule_read "$records" "$allowed" "$owners" "$state_name"
     rm -f -- "$records" "$records.err"
 }
 
@@ -1214,6 +1118,8 @@ file_rule_result() {
         "$emitter" VULNERABLE "$label 소유자·권한 기준 초과" "${state[bad]}" "$manual"
     elif ((state[errors])) || [[ ${state[checked]} == 0 && $empty == ERROR ]]; then
         "$emitter" ERROR "$label Metadata 수집 미완료" "checked=${state[checked]}" "$manual" "$code"
+    elif (( ${state[manual]:-0} )); then
+        "$emitter" MANUAL "$label 수집 기능 또는 소유 계정 확인 필요" "checked=${state[checked]}" "$manual"
     elif ((state[checked] == 0)); then
         "$emitter" "$empty" "$label 점검 대상 파일 없음" 'checked=0' "$manual"
     else "$emitter" "$good" "$label 소유자·권한 기준 충족" "checked=${state[checked]}" "$manual"; fi
@@ -1490,7 +1396,8 @@ snmp_audit_check() {
         rocommunity | rwcommunity | rocommunity6 | rwcommunity6)
             ((communities += 1)); community_strong "$secret" || bad=1 ;;
         com2sec | com2sec6)
-            read -r secret _ <<<"$rest"; community_strong "$secret" || : ;;
+            read -r secret _ <<<"$rest"
+            if community_strong "$secret"; then ((communities += 1)); else bad=1; fi ;;
         *) continue ;;
         esac
         ((rules += 1))
@@ -1517,84 +1424,100 @@ snmp_audit_check() {
 }
 
 scan_result() {
-    local kind=$1 description=$2 policy_key=$3 evidence count missing complete capped
+    local kind=$1 description=$2 policy_key=$3 count missing error evidence
     count=${AUDIT_SCAN_ITEM_COUNT[$kind]:-0}
     missing=${AUDIT_SCAN_ITEM_UNAPPROVED[$kind]:-0}
-    complete=${AUDIT_SCAN_ITEM_COMPLETE[$kind]:-0}
-    capped=${AUDIT_SCAN_ITEM_CAPPED[$kind]:-0}
-    evidence="scope=$AUDIT_SCAN_SCOPE entries=$AUDIT_SCAN_COUNT findings=$count unreviewed=$missing complete=$complete capped=$capped"
-    [[ -z ${AUDIT_SCAN_ITEM_ERROR[$kind]-} ]] || evidence+=" reason=${AUDIT_SCAN_ITEM_ERROR[$kind]}"
+    error=${AUDIT_SCAN_ITEM_ERROR[$kind]-}
+    evidence="scope=$AUDIT_SCAN_SCOPE findings=$count unreviewed=$missing"
+    [[ -z $error ]] || evidence+="; 조회 실패:$error"
     record_value filesystem "$kind" "$evidence"
-    record_value filesystem entry_limit "${AUDIT_CONFIG[scan_max_entries]}"
     record_value filesystem roots "${AUDIT_SCAN_ROOTS[*]}"
-    if ((complete == 0)); then
-        emit_result ERROR '파일 탐색 일부 미완료; 확보한 조회값은 기록에 포함' "$evidence" '조회 기록과 범위·권한·시간·개수 제한·NSS 오류 확인 후 미수집 범위 재검사' INCOMPLETE_SCAN
-    elif [[ ${AUDIT_CONFIG[scan_roots]} != AUTO ]]; then
-        emit_result MANUAL '부분 탐색 범위 결과; 전체 시스템 판정 불가' "$evidence" '지정 범위의 발견 내용 검토 및 전체 범위 별도 확인'
-    elif [[ $kind == AUDIT_ORPHANS && ${AUDIT_NSS_EXTERNAL:-0} == 1 && $count -gt 0 ]]; then
-        emit_result MANUAL '소유 계정 미확인 파일 발견; 외부 NSS 검증 필요' "$evidence" 'LDAP/SSSD/NIS 연결 상태와 소유 계정의 존재 여부 대조'
+    if [[ $kind == AUDIT_ORPHANS && $count -gt 0 && $AUDIT_NSS_EXTERNAL == 0 && $AUDIT_ACCOUNTS_OK == 1 ]]; then
+        emit_result VULNERABLE '소유 계정 또는 그룹이 없는 파일·디렉터리 발견' "$evidence" 'nouser/nogroup별 경로·UID·GID 확인; 조회 실패 경로는 별도 확인'
+    elif [[ $error == *UNSUPPORTED_FIND* ]]; then
+        emit_result MANUAL '지원하는 find 기능 없음' "$evidence" 'GNU find -printf로 해당 항목을 점검'
+    elif [[ -n $error ]]; then
+        emit_result ERROR '파일 탐색 조회 실패; 발견값은 조회 기록에 보존' "$evidence" '경로·권한·NSS 조회 오류 확인' FIND_FAILED
+    elif [[ $kind == AUDIT_ORPHANS && $AUDIT_ACCOUNTS_OK == 0 ]]; then
+        emit_result ERROR '로컬 계정 DB 조회 실패' "$evidence" 'passwd 형식·읽기 권한 확인' ACCOUNT_DB_FAILED
     elif [[ $kind == AUDIT_ORPHANS && $count -gt 0 ]]; then
-        emit_result VULNERABLE "$description 발견" "$evidence" '조회 기록의 UID별 대표 경로·matching_files 건수와 각 owner_candidate의 소유 계정 대조'
+        emit_result MANUAL 'find에서 소유 계정·그룹 미확인; 외부 NSS 응답 상태 확인 필요' "$evidence" 'NSS Provider 설정의 존재와 조회 성공을 동일하게 취급하지 않음; 실제 계정 삭제 여부 확인'
+    elif [[ ${AUDIT_CONFIG[scan_roots]} != AUTO ]]; then
+        emit_result MANUAL '사용자 지정 범위 결과; 전체 시스템 범위 확인 필요' "$evidence"
     elif ((count == 0)); then
-        emit_result GOOD "$description: 전체 검사 범위에서 미발견" "$evidence"
+        emit_result GOOD "$description: 점검 범위에서 미발견" "$evidence"
     elif ((missing == 0)) && [[ -n $policy_key ]]; then
-        emit_result GOOD "$description: 사용자 승인 목록 기준 충족" "$evidence" '현재 입력된 정확한 경로 승인 목록을 기준으로 판정; 승인 근거·운영상 필요성은 사용자 책임으로 검토'
-    else
-        emit_result MANUAL "$description: 미승인 경로 검토 필요" "$evidence" '조회 기록의 전체 발견값·승인 여부와 운영상 필요성을 검토'
-    fi
+        emit_result GOOD "$description: 명시한 승인 목록 충족" "$evidence"
+    else emit_result MANUAL "$description: 미승인 경로 검토 필요" "$evidence" '조회 기록의 전체 발견값·승인 여부와 운영상 필요성 확인'; fi
 }
 
 # --- 항목별 점검 — U-01 ~ U-67 ---
 
-check_u_01() {
-    local state=${AUDIT_SERVICE_STATE[ssh]:-UNKNOWN} value evidence='' telnet=${AUDIT_SERVICE_STATE[telnet]:-UNKNOWN} role
-    for role in ssh telnet r; do
-        record_value "service:$role" runtime "state:${AUDIT_SERVICE_STATE[$role]:-UNKNOWN} ${AUDIT_SERVICE_EVIDENCE[$role]:-수집 없음}"
-    done
-    case $state in
-    RUNNING)
-        if command -v sshd >/dev/null 2>&1; then
-            if ! capture_command "${AUDIT_CONFIG[command_timeout_seconds]}" sshd -T; then
-                emit_result ERROR 'sshd 유효 설정 조회 실패' "${AUDIT_COMMAND_STDERR}" 'Host Key·설정·권한 확인' SSHD_QUERY_FAILED
-                return
-            fi
-            value=$(awk '$1=="permitrootlogin"{print $2;exit}' <<<"$AUDIT_COMMAND_STDOUT")
-            record_value 'sshd -T' PermitRootLogin "$value" "$([[ -n $value ]] && printf OK || printf MISSING)"
-            evidence="OpenSSH effective PermitRootLogin=$value"
-        else
-            value=$(config_value /etc/ssh/sshd_config PermitRootLogin 2>/dev/null) || value=
-            evidence="정적 PermitRootLogin=${value:-미설정}; Runtime 적용·Include 확인 필요"
-        fi
-        case ${value,,} in
-        yes | prohibit-password | without-password | forced-commands-only)
-            emit_result VULNERABLE 'root 직접 SSH 접속이 허용되는 설정' "$evidence" '비밀번호 인증만 금지해도 Public Key root 접속은 허용될 수 있음'
-            return ;;
-        no) ;;
-        *)
-            emit_result MANUAL 'root SSH 접속 차단을 확정할 수 없음' "$evidence" 'sshd -T 및 Match/Include·다른 SSH Provider 확인'
-            return ;;
+ssh_read_config() {
+    # SSH만 first-match로 읽는다. Include의 Match도 공유 상태에 반영한다.
+    local path=$1 text line key value rest pattern file
+    local -a patterns=()
+    if [[ -v SSH_VISITED[$path] ]]; then SSH_CONFIG_ERROR+="중복/순환 Include:$path; "; return; fi
+    SSH_VISITED[$path]=1
+    text=$(read_target "$path") || { SSH_CONFIG_ERROR+="읽기 실패:$path; "; return; }
+    while IFS= read -r line; do
+        line=${line%%#*}
+        read -r key value rest <<<"$line"
+        case ${key,,} in
+            match) SSH_HAS_MATCH=1; record_value "$path" Match "$value $rest" ;;
+            include)
+                read -r -a patterns <<<"$value $rest"
+                for pattern in "${patterns[@]}"; do
+                    if [[ $pattern == *\"* || $pattern == *\'* || $pattern == *\\* ]]; then SSH_CONFIG_ERROR+='Include 경로 구문 미해석; '; continue; fi
+                    [[ $pattern == /* ]] || pattern="/etc/ssh/$pattern"
+                    while IFS= read -r file; do ssh_read_config "$file"; done < <(compgen -G "$pattern" | sort)
+                done ;;
+            permitrootlogin)
+                record_value "$path" PermitRootLogin "$value"
+                if [[ -z $SSH_STATIC_VALUE && $SSH_HAS_MATCH == 0 ]]; then SSH_STATIC_VALUE=$value; fi ;;
         esac
-        if active_lines /etc/ssh/sshd_config 2>/dev/null | grep -qiE '^[[:space:]]*(Match|Include)[[:space:]]'; then
-            emit_result MANUAL '전역 root 차단 확인; 조건부 설정 추가 확인 필요' "$evidence" 'Include 전체 및 연결 조건별 sshd -T -C 결과 확인'
-            return
-        fi
-        ;;
-    STOPPED | ABSENT) evidence="SSH $state" ;;
-    *)
-        emit_result ERROR 'SSH 실행 여부 미확정' "${AUDIT_SERVICE_EVIDENCE[ssh]:-수집 없음}" '' SERVICE_UNRESOLVED
-        return ;;
+    done <<<"$text"
+}
+
+check_u_01() {
+    local state=${AUDIT_SERVICE_STATE[ssh]:-UNKNOWN} role value='' effective=0 evidence='' telnet=${AUDIT_SERVICE_STATE[telnet]:-UNKNOWN}
+    local SSH_STATIC_VALUE='' SSH_HAS_MATCH=0 SSH_CONFIG_ERROR=''
+    local -A SSH_VISITED=()
+    for role in ssh telnet r; do record_value "service:$role" runtime "state:${AUDIT_SERVICE_STATE[$role]:-UNKNOWN} ${AUDIT_SERVICE_EVIDENCE[$role]:-수집 없음}"; done
+    case $state in
+        RUNNING)
+            if command -v sshd >/dev/null 2>&1 && capture_command "${AUDIT_CONFIG[command_timeout_seconds]}" sshd -T; then
+                value=$(awk '$1=="permitrootlogin"{print $2;exit}' <<<"$AUDIT_COMMAND_STDOUT")
+                [[ -z $value ]] || effective=1
+                record_value 'sshd -T' PermitRootLogin "$value"
+            fi
+            ssh_read_config /etc/ssh/sshd_config
+            if ((effective == 0)); then value=$SSH_STATIC_VALUE; fi
+            evidence="PermitRootLogin:${value:-미설정} effective:$effective Match:$SSH_HAS_MATCH; $SSH_CONFIG_ERROR"
+            if ((SSH_HAS_MATCH)) || [[ -n $SSH_CONFIG_ERROR ]]; then
+                emit_result MANUAL 'SSH 조건별 설정 또는 정적 조회 범위 확인 필요' "$evidence" 'Include 내부 Match를 포함해 접속 조건별 sshd -T -C로 확인'; return
+            fi
+            case ${value,,} in
+                yes|prohibit-password|without-password|forced-commands-only)
+                    emit_result VULNERABLE 'root 직접 SSH 접속을 허용하는 설정' "$evidence" '확인된 전역 허용값과 조건별 예외를 검토'; return ;;
+                no) ;;
+                *) emit_result MANUAL 'root SSH 차단 설정을 확정하지 못함' "$evidence" '실제 Provider·설정 경로·sshd 조회 실패 확인'; return ;;
+            esac
+            ;;
+        STOPPED|ABSENT) evidence="SSH $state" ;;
+        *) emit_result ERROR 'SSH 실행 여부 조회 실패' "${AUDIT_SERVICE_EVIDENCE[ssh]:-수집 없음}" '' SERVICE_UNRESOLVED; return ;;
     esac
     if [[ $telnet == RUNNING || ${AUDIT_SERVICE_STATE[r]:-UNKNOWN} == RUNNING ]]; then
-        emit_result MANUAL '레거시 원격 터미널 root 제한 확인 필요' "$evidence; telnet=$telnet r=${AUDIT_SERVICE_STATE[r]:-UNKNOWN}" 'pam_securetty 적용 경로·securetty·rlogin 인증 확인'
+        emit_result MANUAL '레거시 원격 터미널 root 제한 확인 필요' "$evidence" 'Telnet/rlogin 인증 경로 확인'
     elif [[ $telnet == UNKNOWN || ${AUDIT_SERVICE_STATE[r]:-UNKNOWN} == UNKNOWN ]]; then
-        emit_result MANUAL 'SSH 결과는 확보했으나 다른 원격 터미널 범위 미확정' "$evidence" 'Telnet/rlogin 및 SSH Provider 전체 확인'
+        emit_result MANUAL '다른 원격 터미널 범위 미확정' "$evidence"
     else emit_result GOOD '원격 root 직접 접속 경로가 비실행 또는 차단됨' "$evidence"; fi
 }
 
 check_u_02() {
     require_accounts || return
     record_value criterion password_policy 'minlen>=8, remember>=4, min_days>=1, max_days=1~90; minclass>=4 또는 dcredit<0·ocredit<0·(lcredit<0 또는 ucredit<0); root 품질·이력 강제 적용'
-    local strict=0 rc=0 path pooled='' min max name state alg lo hi bad_age='' bad='' defaults_good=0
+    local strict=0 rc=0 path pooled='' min='' max='' name state alg lo hi bad_age='' bad_defaults='' age_unknown='' parse_error=0 defaults_good=0
     if path_exists /etc/pam.d/passwd && pam_load /etc/pam.d/passwd password; then strict=1
     else
         for path in /etc/pam.d/common-password /etc/pam.d/system-auth /etc/pam.d/password-auth /etc/pam.d/passwd /etc/pam.d/login; do
@@ -1605,31 +1528,33 @@ check_u_02() {
         PAM_ROWS=$pooled
     fi
     pam_simple_password_policy "$strict" || rc=$?
-    min=$(config_value /etc/login.defs PASS_MIN_DAYS 2>/dev/null) || { min=0; record_value /etc/login.defs PASS_MIN_DAYS "$min" DERIVED; }
-    max=$(config_value /etc/login.defs PASS_MAX_DAYS 2>/dev/null) || { max=99999; record_value /etc/login.defs PASS_MAX_DAYS "$max" DERIVED; }
-    if [[ $min =~ ^[0-9]+$ && $max =~ ^[0-9]+$ ]] && ((10#$min >= 1 && 10#$max >= 1 && 10#$max <= 90)); then defaults_good=1; fi
+    if min=$(config_value /etc/login.defs PASS_MIN_DAYS 2>/dev/null); then
+        if [[ $min =~ ^[0-9]{1,9}$ ]]; then ((10#$min >= 1)) || bad_defaults+="PASS_MIN_DAYS:$min; "
+        else parse_error=1; fi
+    fi
+    if max=$(config_value /etc/login.defs PASS_MAX_DAYS 2>/dev/null); then
+        if [[ $max =~ ^[0-9]{1,9}$ ]]; then ((10#$max >= 1 && 10#$max <= 90)) || bad_defaults+="PASS_MAX_DAYS:$max; "
+        else parse_error=1; fi
+    fi
+    [[ -z $min || -z $max || -n $bad_defaults || $parse_error == 1 ]] || defaults_good=1
     if ((AUDIT_SHADOW_OK)); then
         while IFS=: read -r name state alg lo hi _; do
             [[ $state == HASH || $state == EMPTY ]] || continue
-            if [[ ! $lo =~ ^[0-9]+$ || ! $hi =~ ^[0-9]+$ ]] || ((lo < 1 || hi < 1 || hi > 90)); then bad_age+="$name "; fi
+            if [[ ! $lo =~ ^[0-9]{1,9}$ || ! $hi =~ ^[0-9]{1,9}$ ]]; then age_unknown+="$name min_days:$lo max_days:$hi; "
+            elif ((10#$lo < 1 || 10#$hi < 1 || 10#$hi > 90)); then bad_age+="$name min_days:$lo max_days:$hi; "; fi
         done <<<"$AUDIT_SHADOW_ROWS"
     fi
-    if ((rc == 0 && defaults_good && AUDIT_SHADOW_OK)) && [[ -z $bad_age ]]; then
-        account_emit GOOD 'passwd PAM의 필수 품질·이력·root 적용 및 사용기간 확인' "$PAM_POLICY_EVIDENCE PASS_MIN_DAYS=$min PASS_MAX_DAYS=$max"
+    local evidence="$PAM_POLICY_EVIDENCE PASS_MIN_DAYS:${min:-미설정} PASS_MAX_DAYS:${max:-미설정}; $bad_defaults$bad_age$age_unknown"
+    if [[ -n $bad_defaults || -n $bad_age ]]; then
+        emit_result VULNERABLE '조회한 비밀번호 사용기간이 기준 미충족' "$evidence" '고객사 승인 예외는 별도 검토; 다른 PAM 해석 불확실성으로 확인된 취약값을 덮어쓰지 않음'
     elif ((rc == 1)); then
-        emit_result VULNERABLE '적용 경로를 해석한 필수 PAM 비밀번호 정책이 수치 기준 미충족' "$PAM_POLICY_EVIDENCE"
-    elif ((rc == 0 && defaults_good)) && [[ -n $bad_age ]]; then
-        emit_result VULNERABLE '기존 계정 비밀번호 사용기간이 기준 미충족' "$bad_age"
-    elif ((PAM_POLICY_QUALITY == 0)); then
-        emit_result MANUAL 'PAM 비밀번호 품질 Module의 유효 적용을 확인하지 못함' 'pwquality/cracklib 적용 경로 미확정' 'PAM 미사용 Provider·Include Chain·passwd 프로그램의 실제 정책 확인'
-    elif [[ ! $min =~ ^[0-9]+$ || ! $max =~ ^[0-9]+$ ]]; then
-        emit_result ERROR '비밀번호 정책 숫자 Parsing 실패' '/etc/login.defs' '' PARSE_FAILED
+        emit_result VULNERABLE '적용 경로가 확인된 필수 PAM 비밀번호 정책의 수치 미충족' "$evidence"
+    elif ((parse_error || !AUDIT_SHADOW_OK)); then
+        emit_result ERROR '비밀번호 기간값 해석 또는 shadow 조회 실패' "$evidence" '원래 값과 파일 읽기 권한 확인' PASSWORD_POLICY_READ_FAILED
+    elif ((rc == 0 && defaults_good)) && [[ -z $age_unknown ]]; then
+        account_emit GOOD '비밀번호 품질·이력·root 적용과 사용기간 기준 충족' "$evidence"
     else
-        ((PAM_POLICY_LENGTH && defaults_good)) || bad+='길이/기억/기간 기본 설정; '
-        ((PAM_POLICY_COMPLEXITY)) || bad+='영문·숫자·특수문자 조합; '
-        [[ -z $bad_age ]] || bad+="기존 계정 사용기간: $bad_age; "
-        if [[ -n $bad ]]; then emit_result MANUAL '정적 기준 미충족 후보; 유효 정책 전체 확인 필요' "$PAM_POLICY_EVIDENCE min_days=$min max_days=$max; $bad" 'pwquality.conf.d·Module Option·PAM Include/Control·root 강제 적용·기존 계정 만료값 확인'
-        else emit_result MANUAL '가이드 수치와 일치하는 설정 확보; PAM 유효 적용 확인 필요' "$PAM_POLICY_EVIDENCE min_days=$min max_days=$max" 'PAM Control Flow·Include Chain 및 root에 품질·이력 정책이 실제 강제되는지 확인'; fi
+        emit_result MANUAL '확인한 값은 기록했으나 미설정·유효 PAM 적용 범위 확인 필요' "$evidence" 'PAM Control/Include·품질·이력·기존 계정의 미설정 기간 확인'
     fi
 }
 
@@ -1865,7 +1790,7 @@ check_u_14() {
     else emit_result MANUAL '현재 root 호출 Session에서 위험한 PATH 구간 미발견' '현재 디렉터리 앞/중간 미포함' '시스템·root 초기화 파일의 로그인별 PATH도 확인'; fi
 }
 
-check_u_15() { scan_result AUDIT_ORPHANS '소유 계정 없는 파일·디렉터리' ''; }
+check_u_15() { scan_result AUDIT_ORPHANS '소유 계정·그룹 없는 파일·디렉터리' ''; }
 
 check_u_16() { check_file_rule /etc/passwd 0644; }
 
@@ -1875,7 +1800,7 @@ check_u_17() {
     for dir in /etc/init.d /etc/rc.d/init.d /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system /etc/local.d; do
         file_rule_scan "$dir" 0755 0 rules 2
     done
-    file_rule_result '시작 스크립트/Unit' rules MANUAL ERROR 'Unit ExecStart·EnvironmentFile·Drop-in 및 다른 Init의 실제 실행 파일까지 확인' emit_result STARTUP_SCAN_INCOMPLETE
+    file_rule_result '시작 스크립트/Unit' rules MANUAL ERROR 'Unit ExecStart·EnvironmentFile·Drop-in 및 다른 Init의 실제 실행 파일까지 확인' emit_result FIND_FAILED
 }
 
 check_u_18() { check_file_rule /etc/shadow 0400; }
@@ -1911,17 +1836,15 @@ check_u_23() { scan_result AUDIT_SPECIAL_FILES 'SUID/SGID 파일' approved_speci
 
 check_u_24() {
     require_accounts || return
-    local uid home f path
-    local -A rules=([checked]=0 [errors]=0 [bad]='')
+    local uid home
+    local -A rules=([checked]=0 [errors]=0 [bad]='') seen=()
     while IFS=: read -r _ uid _ home _; do
         [[ $home == /* && $home != / ]] || continue
-        [[ -d $home ]] || { record_value "$home" directory no MISSING; continue; }
-        for f in .profile .bash_profile .bash_login .bashrc .bash_logout .cshrc .tcshrc .zshrc .zprofile .kshrc .login; do
-            path="$home/$f"
-            if path_exists "$path"; then file_rule_add "$path" 0755 "0,$uid" rules || :; fi
-        done
+        [[ ! -v seen["$home|$uid"] ]] || continue
+        seen["$home|$uid"]=1
+        file_rule_scan "$home" 0755 "0,$uid" rules 1
     done <<<"$AUDIT_ACCOUNT_ROWS"
-    file_rule_result '계정 환경 파일' rules GOOD GOOD 'Shell별 동적 Include는 별도 확인' account_emit
+    file_rule_result '계정 환경 파일' rules GOOD GOOD '11개 환경 파일과 연결된 대상의 소유자·권한 확인; 동적 Include 별도 확인' account_emit
 }
 
 check_u_25() { scan_result AUDIT_WORLD_FILES 'World-writable 일반 파일' approved_world_writable_paths; }
@@ -1931,16 +1854,12 @@ check_u_26() {
     [[ -d /dev ]] || { record_value /dev directory no MISSING; emit_result ERROR '/dev 디렉터리 없음' '' '' PATH_FAILED; return; }
     local records="$AUDIT_WORK_DIR/dev.$BASHPID"
     if ! collect_paths "$records" /dev -type f -print0; then
-        emit_result ERROR '/dev 탐색 실패' '' '' INCOMPLETE_SCAN
+        emit_result ERROR '/dev 탐색 실패' '' '' FIND_FAILED
         return
     fi
     while IFS= read -r -d '' path; do
-        if ! audit_within_deadline; then
-            emit_result ERROR '/dev 처리 시간 초과' "checked=$count; $out" '' INCOMPLETE_SCAN
-            return
-        fi
         ((count += 1))
-        approved=0; list_has "${AUDIT_CONFIG[approved_device_files]}" "$path" && approved=1
+        approved=0; list_has_line "${AUDIT_CONFIG[approved_device_files]}" "$path" && approved=1
         record_value "$path" approved "$approved"
         if ((approved == 0 && ${#out} < 24000)); then out+="$path"$'\n'; fi
     done <"$records"
@@ -1971,47 +1890,180 @@ check_u_27() {
     else emit_result MANUAL 'r 계열 서비스 사용: 파일 소유 계정 및 신뢰 관계 검토 필요' "files=$seen" '소유자는 root/해당 계정인지, 허용 Host/User의 적절성 확인'; fi
 }
 
+ipv4_network() {
+    local address=${1%/*} prefix=32 a b c d extra octet
+    [[ $1 != */* ]] || prefix=${1##*/}
+    [[ $prefix =~ ^[0-9]{1,2}$ ]] && ((10#$prefix <= 32)) || return 1
+    IFS=. read -r a b c d extra <<<"$address"
+    [[ -z $extra ]] || return 1
+    for octet in "$a" "$b" "$c" "$d"; do [[ $octet =~ ^[0-9]{1,3}$ ]] && ((10#$octet <= 255)) || return 1; done
+    IPV4_PREFIX=$((10#$prefix))
+    IPV4_MASK=$((IPV4_PREFIX == 0 ? 0 : (0xffffffff << (32 - IPV4_PREFIX)) & 0xffffffff))
+    IPV4_NETWORK=$((((10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d) & IPV4_MASK))
+}
+
+management_source_allowed() {
+    # 0=승인 범위, 1=IPv4 승인 범위 밖, 2=추가 해석 필요.
+    local source=$1 family=$2 approved network prefix valid=0
+    if [[ $family == 6 ]]; then
+        list_has "${AUDIT_CONFIG[allowed_management_cidrs]}" "$source" && return 0
+        return 2
+    fi
+    ipv4_network "$source" || return 2
+    network=$IPV4_NETWORK; prefix=$IPV4_PREFIX
+    while IFS= read -r approved; do
+        [[ -n $approved && $approved != *:* ]] || continue
+        ipv4_network "$approved" || return 2
+        valid=1
+        if ((prefix >= IPV4_PREFIX && (network & IPV4_MASK) == IPV4_NETWORK)); then return 0; fi
+    done <<<"${AUDIT_CONFIG[allowed_management_cidrs]//,/$'\n'}"
+    ((valid)) && return 1
+    return 2
+}
+
+iptables_management_policy() {
+    # 단순한 filter/INPUT만 확정한다. 해석하지 못한 매치·점프는 GOOD 근거로 쓰지 않는다.
+    local text=$1 family=$2 table='' policy='' line token source protocol target ports states iface port rc
+    local -a args=() selected_ports=()
+    local -A closed=([21]=0 [22]=0 [23]=0)
+    FW_REASON=
+    while IFS= read -r line; do
+        case $line in
+            \#*|'') continue ;;
+            \**) table=${line#\*}; continue ;;
+            ':INPUT '*) if [[ $table == filter ]]; then read -r _ policy _ <<<"$line"; fi; continue ;;
+            '-A '*) ;;
+            *) continue ;;
+        esac
+        [[ $table == filter ]] || { FW_REASON='filter 외 테이블 규칙 해석 필요'; return 2; }
+        [[ $line == '-A INPUT '* ]] || continue
+        read -r -a args <<<"${line#-A INPUT }"
+        source=0.0.0.0/0; [[ $family != 6 ]] || source=::/0
+        protocol=all; target=; ports=; states=; iface=
+        while ((${#args[@]})); do
+            token=${args[0]}; args=("${args[@]:1}")
+            case $token in
+                -s|--source) source=${args[0]-}; args=("${args[@]:1}") ;;
+                -p|--protocol) protocol=${args[0]-}; args=("${args[@]:1}") ;;
+                -j|--jump) target=${args[0]-}; args=("${args[@]:1}") ;;
+                --dport|--destination-port|--dports) ports=${args[0]-}; args=("${args[@]:1}") ;;
+                --ctstate|--state) states=${args[0]-}; args=("${args[@]:1}") ;;
+                -i|--in-interface) iface=${args[0]-}; args=("${args[@]:1}") ;;
+                -m|--match)
+                    case ${args[0]-} in tcp|multiport|conntrack|state) args=("${args[@]:1}") ;;
+                        *) FW_REASON="미해석 모듈:$line"; return 2 ;; esac ;;
+                *) FW_REASON="미해석 조건:$line"; return 2 ;;
+            esac
+        done
+        [[ $iface != lo ]] || continue
+        [[ $protocol == tcp || $protocol == all ]] || continue
+        [[ -z $iface ]] || { FW_REASON="인터페이스 조건:$line"; return 2; }
+        if [[ -n $states ]] && ! list_has "$states" NEW; then
+            case $states in ESTABLISHED|RELATED|ESTABLISHED,RELATED|RELATED,ESTABLISHED|INVALID) continue ;;
+                *) FW_REASON="연결 상태 조건:$line"; return 2 ;; esac
+        fi
+        [[ $ports != *:* && $ports != *-* ]] || { FW_REASON="포트 범위:$line"; return 2; }
+        selected_ports=()
+        for port in 21 22 23; do
+            [[ -z $ports ]] || list_has "$ports" "$port" || continue
+            [[ ${closed[$port]} == 0 ]] && selected_ports+=("$port")
+        done
+        ((${#selected_ports[@]})) || continue
+        record_value "iptables:IPv$family" management_rule "$line"
+        case $target in
+            DROP|REJECT)
+                [[ $source == 0.0.0.0/0 || $source == ::/0 ]] || { FW_REASON="선행 Source별 차단:$line"; return 2; }
+                for port in "${selected_ports[@]}"; do closed[$port]=1; done ;;
+            ACCEPT)
+                if [[ $source == 0.0.0.0/0 || $source == ::/0 ]]; then FW_REASON="관리 포트 전체 Source 허용:$line"; return 1; fi
+                rc=0; management_source_allowed "$source" "$family" || rc=$?
+                if ((rc == 1)); then FW_REASON="승인 CIDR 밖의 관리 포트 허용:$line"; return 1
+                elif ((rc)); then FW_REASON="Source/CIDR 관계 미해석:$line"; return 2; fi ;;
+            *) FW_REASON="다른 체인/Target:$line"; return 2 ;;
+        esac
+    done <<<"$text"
+    [[ $policy == DROP ]] || { FW_REASON="INPUT 기본 정책:${policy:-미확인}"; return 2; }
+    FW_REASON='관리 포트의 신규 TCP 허용 Source가 승인 범위이며 INPUT 기본 정책 DROP'
+    return 0
+}
+
 check_u_28() {
-    local evidence='' query_ok=0 tool
+    local evidence='' query_ok=0 tool family rc good=0 bad='' unknown='' nft_rules=''
+    local -A rules=()
     record_value policy allowed_management_cidrs "${AUDIT_CONFIG[allowed_management_cidrs]}"
     for tool in nft iptables-save ip6tables-save ufw firewall-cmd; do
         command -v "$tool" >/dev/null 2>&1 || { record_value "$tool" available no MISSING; continue; }
         case $tool in
-        nft) capture_command "${AUDIT_CONFIG[command_timeout_seconds]}" nft list ruleset || continue ;;
-        iptables-save | ip6tables-save) capture_command "${AUDIT_CONFIG[command_timeout_seconds]}" "$tool" || continue ;;
-        ufw) capture_command "${AUDIT_CONFIG[command_timeout_seconds]}" ufw status verbose || continue ;;
-        firewall-cmd) capture_command "${AUDIT_CONFIG[command_timeout_seconds]}" firewall-cmd --list-all-zones || continue ;;
+            nft) capture_command "${AUDIT_CONFIG[command_timeout_seconds]}" nft list ruleset || continue ;;
+            iptables-save|ip6tables-save) capture_command "${AUDIT_CONFIG[command_timeout_seconds]}" "$tool" || continue ;;
+            ufw) capture_command "${AUDIT_CONFIG[command_timeout_seconds]}" ufw status verbose || continue ;;
+            firewall-cmd) capture_command "${AUDIT_CONFIG[command_timeout_seconds]}" firewall-cmd --list-all-zones || continue ;;
         esac
-        query_ok=1
+        query_ok=1; rules[$tool]=$AUDIT_COMMAND_STDOUT
         record_value "$tool" rules "$AUDIT_COMMAND_STDOUT"
         evidence+="$tool:"$'\n'"${AUDIT_COMMAND_STDOUT:0:12000}"$'\n'
     done
-    if ((query_ok)); then
-        emit_result MANUAL '실제 Firewall 증거 수집 완료; 허용 정책과 순서 검토 필요' "$evidence" "allowed_management_cidrs=${AUDIT_CONFIG[allowed_management_cidrs]:-미입력}; IPv4/IPv6·Rule 순서·Default Policy·Cloud/상위 ACL 포함 확인"
-    else emit_result ERROR '사용 가능한 Firewall 조회가 모두 실패하거나 도구 없음' '도구 없음은 차단/안전을 뜻하지 않음' '권한·Kernel·대체 Firewall·상위 ACL 확인' FIREWALL_QUERY_FAILED; fi
+    if ((query_ok == 0)); then emit_result ERROR 'Firewall 조회 실패 또는 도구 없음' '' '권한·사용 Provider 확인' FIREWALL_QUERY_FAILED; return; fi
+    if [[ -z ${AUDIT_CONFIG[allowed_management_cidrs]} ]]; then
+        emit_result MANUAL 'Firewall 규칙 수집; 승인 관리망 입력 필요' "$evidence" 'allowed_management_cidrs와 실제 유입 경로 대조'; return
+    fi
+    for family in 4 6; do
+        tool=iptables-save; [[ $family != 6 ]] || tool=ip6tables-save
+        if [[ ! -v rules[$tool] ]]; then unknown+="IPv$family INPUT 미조회; "; continue; fi
+        rc=0; iptables_management_policy "${rules[$tool]}" "$family" || rc=$?
+        record_value "$tool" management_policy "$FW_REASON" DERIVED
+        case $rc in 0) ((good += 1)) ;; 1) bad+="IPv$family:$FW_REASON; " ;; *) unknown+="IPv$family:$FW_REASON; " ;; esac
+    done
+    # 별도 nft hook의 DROP이 ACCEPT를 다시 제한할 수 있어 취약 확정에 함께 고려한다.
+    nft_rules=${rules[nft]-}
+    if [[ -n $bad && -v rules[nft] && -z $nft_rules ]]; then
+        emit_result VULNERABLE '관리 포트에 전체 Source 또는 승인 CIDR 밖의 허용 규칙' "$bad$unknown" '확인된 INPUT 규칙과 상위 ACL을 대조'
+    elif ((good == 2)); then
+        emit_result GOOD 'IPv4/IPv6 관리 포트의 단순 INPUT 규칙이 승인 CIDR·기본 DROP 기준 충족' "$evidence" '검사 범위: 신규 TCP 21/22/23, 현재 Network Namespace'
+    else emit_result MANUAL 'Firewall 유효 규칙의 추가 해석 필요' "$bad$unknown" 'nft/체인 점프·조건·IPv6 CIDR 표현·규칙 순서와 실제 유입 경로 확인; 원래 규칙은 조회 기록 참조'; fi
 }
 
 check_u_29() { check_file_rule /etc/hosts.lpd 0600 0 1; }
 
 check_u_30() {
-    local p value found=0 bad='' evidence=''
-    record_value criterion UMASK 'Group/Other 쓰기 차단: (umask & 0022) == 0022'
-    for p in /etc/login.defs /etc/profile /etc/bashrc /etc/bash.bashrc; do
-        value=$(config_value "$p" UMASK 2>/dev/null) || continue
-        found=1
-        evidence+="$p UMASK=$value"$'\n'
-        if [[ $value =~ ^[0-7]{3,4}$ ]]; then
-            (((8#$value & 0022) == 0022)) || bad+="$p "
-        else
-            emit_result MANUAL 'Symbolic/동적 UMASK 유효값 확인 필요' "$evidence" '로그인 경로별 실제 umask 확인'
-            return
-        fi
+    local path text rows line value direct complex found=0 definite='' ambiguous='' good bad count
+    record_value criterion UMASK 'umask&0022=0022; 단일/동일한 무조건 취약값은 VULNERABLE, 조건·혼합값은 MANUAL'
+    for path in /etc/login.defs /etc/profile /etc/bashrc /etc/bash.bashrc; do
+        path_exists "$path" || continue
+        text=$(read_target "$path") || { ambiguous+="$path 읽기 실패; "; continue; }
+        complex=0
+        if [[ $path != /etc/login.defs ]] && grep -Eq '(^|[;[:space:]])(if|elif|else|case|for|while|until|function|source)([[:space:]]|$)|[{}]|&&|\|\|' <<<"$text"; then complex=1; fi
+        rows=$(awk '
+            /^[[:space:]]*#/ {next}
+            {line=$0;sub(/[[:space:]]*#.*/,"",line)
+             while(match(line,/(^|[;[:space:]])[uU][mM][aA][sS][kK][[:space:]]+[^;[:space:]]+/)) {
+                 token=substr(line,RSTART,RLENGTH);sub(/^[;[:space:]]*/,"",token)
+                 sub(/^[^[:space:]]+[[:space:]]+/,"",token)
+                 direct=(substr(line,1,RSTART-1) ~ /^[[:space:]]*$/)
+                 gsub(/"/,"",token);gsub(sprintf("%c",39),"",token)
+                 printf "%d:%s:%d\n",NR,token,direct
+                 line=substr(line,RSTART+RLENGTH)
+             }}' <<<"$text")
+        [[ -n $rows ]] || { record_value "$path" UMASK '' MISSING; continue; }
+        good=0; bad=0; count=0
+        while IFS=: read -r line value direct; do
+            ((found += 1, count += 1))
+            record_value "$path:$line" UMASK "$value"
+            ((direct)) || complex=1
+            if [[ $value =~ ^[0-7]{3,4}$ ]]; then
+                if (((8#$value & 0022) == 0022)); then ((good += 1)); else ((bad += 1)); fi
+            else complex=1; fi
+        done <<<"$rows"
+        if ((bad && !good && !complex)); then definite+="$path:조건 없는 취약값 $bad개; "
+        elif ((bad || complex)); then ambiguous+="$path:조건문 내 다른 값 존재 가능(수집:$count, 충족:$good, 미충족:$bad); "; fi
     done
-    if [[ -n $bad ]]; then
-        emit_result VULNERABLE 'UMASK가 Group/Other 쓰기를 차단하지 않음' "$evidence"
+    if [[ -n $definite ]]; then
+        emit_result VULNERABLE '조건 없이 명시된 UMASK가 Group/Other 쓰기를 차단하지 않음' "$definite$ambiguous"
+    elif [[ -n $ambiguous ]]; then
+        emit_result MANUAL 'UMASK 조건·혼합값의 유효 적용 확인 필요' "$ambiguous"
     elif ((found)); then
-        emit_result MANUAL '가이드 범위의 UMASK 설정 확보' "$evidence" 'profile.d·사용자 Shell 초기화·서비스별 덮어쓰기 확인'
-    else emit_result MANUAL 'UMASK 적용 경로 미확정' '' '로그인 Shell·PAM·서비스의 실제 UMASK 확인'; fi
+        emit_result MANUAL '수집한 UMASK 수치는 충족; 로그인 경로별 적용 확인 필요' "values:$found" 'profile.d·사용자 Shell·PAM·서비스별 덮어쓰기 확인'
+    else emit_result MANUAL 'UMASK 설정값 미발견' '' '로그인 경로별 유효값 확인'; fi
 }
 
 check_u_31() {
@@ -2080,18 +2132,16 @@ check_u_35() {
 check_u_36() { check_disabled_service r; }
 
 check_u_37() {
-    local path dir
+    require_accounts || return
+    local dir
     local -A rules=([checked]=0 [errors]=0 [bad]='')
-    for path in /usr/bin/crontab /usr/bin/at /bin/crontab /bin/at; do
-        if path_exists "$path"; then file_rule_add "$path" 0750 0 rules || :; fi
+    record_value criterion cron_permissions '명령:root, mode&0022=0(SUID/SGID 허용); 설정·spool:mode&0027=0; cron spool 소유자는 root 또는 파일명 계정'
+    file_rule_paths 7755 0 rules /usr/bin/crontab /usr/bin/at /bin/crontab /bin/at
+    file_rule_paths 7750 0 rules /etc/crontab /etc/anacrontab /etc/cron.allow /etc/cron.deny /etc/at.allow /etc/at.deny
+    for dir in /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /var/spool/cron /var/spool/at; do
+        file_rule_scan "$dir" 7750 0 rules
     done
-    for path in /etc/crontab /etc/anacrontab /etc/cron.allow /etc/cron.deny /etc/at.allow /etc/at.deny; do
-        if path_exists "$path"; then file_rule_add "$path" 0640 0 rules || :; fi
-    done
-    for dir in /etc/cron.d /var/spool/cron /var/spool/at /var/spool/cron/atjobs; do
-        file_rule_scan "$dir" 0640 0 rules
-    done
-    file_rule_result 'cron/at 명령·설정' rules GOOD MANUAL 'OS 기본 SGID·사용자 crontab 운용과 다른 Scheduler·비표준 경로는 별도 확인'
+    file_rule_result 'cron/at 명령·설정' rules GOOD MANUAL 'cron spool 계정 매핑·비표준 Scheduler 범위 확인; at spool은 root 소유 기준'
 }
 
 check_u_38() { check_disabled_service dos; }
@@ -2277,29 +2327,67 @@ check_u_59() { snmp_audit_check 59; }
 check_u_60() { snmp_audit_check 60; }
 check_u_61() { snmp_audit_check 61; }
 
+banner_matches() {
+    local path=$1 content marker matched=1
+    [[ -e $path || -L $path ]] || { record_value "$path" exists no MISSING; return 1; }
+    content=$(read_target "$path") || return 2
+    record_value "$path" banner "$content"
+    while IFS= read -r marker; do
+        [[ -n $marker ]] || continue
+        if [[ $content == *"$marker"* ]]; then record_value "$path" marker_match "$marker:yes"
+        else matched=0; record_value "$path" marker_match "$marker:no"; fi
+    done <<<"${AUDIT_CONFIG[approved_banner_markers]}"
+    ((matched))
+}
+
 check_u_62() {
-    local path content marker seen=0 found=0 evidence='' bad=0
+    local path rc local_match=0 net_match=0 read_error=0 role banner='' unresolved=''
     record_value policy approved_banner_markers "${AUDIT_CONFIG[approved_banner_markers]}"
-    for path in /etc/issue /etc/issue.net /etc/motd; do
-        path_exists "$path" || continue
-        ((seen += 1))
-        content=$(read_target "$path") || {
-            emit_result ERROR 'Warning Banner 읽기 실패' "$path" '' READ_FAILED
-            return
-        }
-        evidence+="$path bytes=${#content} "
-        record_value "$path" banner "$content"
-        if [[ -n ${AUDIT_CONFIG[approved_banner_markers]} ]]; then
-            found=1
-            while IFS= read -r marker; do
-                [[ -z $marker ]] && continue
-                record_value "$path" marker_match "marker:$marker present:$([[ $content == *"$marker"* ]] && printf yes || printf no)"
-                [[ $content == *"$marker"* ]] || found=0
-            done <<<"${AUDIT_CONFIG[approved_banner_markers]}"
-            ((found)) || bad=1
-        fi
+    if [[ -z ${AUDIT_CONFIG[approved_banner_markers]//[$'\r\n\t ']/} ]]; then
+        for path in /etc/issue /etc/issue.net /etc/motd; do
+            path_exists "$path" && record_value "$path" banner "$(read_target "$path")"
+        done
+        emit_result MANUAL '승인 경고 문구와 실제 로그인·서비스 적용 확인 필요' '' 'approved_banner_markers에 필수 문구 입력'; return
+    fi
+    for path in /etc/issue /etc/issue.net; do
+        rc=0; banner_matches "$path" || rc=$?
+        if ((rc == 0)); then
+            if [[ $path == /etc/issue ]]; then local_match=1; else net_match=1; fi
+        elif ((rc == 2)); then read_error=1; fi
     done
-    emit_result MANUAL '서버·실행 서비스별 Warning Banner 적용 확인 필요' "files=$seen marker_mismatch=$bad $evidence" '승인 문구를 입력하고 SSH Banner·Telnet·FTP·SMTP·DNS별 실제 노출·경고 내용을 검토. 파일 존재만으로 양호 판정하지 않음'
+    if ((local_match == 0 && net_match == 0)); then
+        if ((read_error)); then emit_result ERROR '경고 문구 파일 조회 실패' '' '' READ_FAILED
+        else emit_result VULNERABLE 'issue/issue.net 어느 파일에도 승인 마커 전체가 없음' '' '필수 경고 문구와 실제 서비스 연결 설정 확인'; fi
+        return
+    fi
+    ((local_match)) || unresolved+='로컬 /etc/issue의 승인 문구 미확인; '
+    for role in ssh telnet ftp mail dns; do
+        record_value "service:$role" state "${AUDIT_SERVICE_STATE[$role]:-UNKNOWN}"
+        if [[ $role != ssh ]]; then
+            case ${AUDIT_SERVICE_STATE[$role]:-UNKNOWN} in RUNNING|UNKNOWN) unresolved+="$role 실제 Banner 적용 확인 필요; " ;; esac
+            continue
+        fi
+        case ${AUDIT_SERVICE_STATE[ssh]:-UNKNOWN} in
+            RUNNING)
+                if ! command -v sshd >/dev/null 2>&1 || ! capture_command "${AUDIT_CONFIG[command_timeout_seconds]}" sshd -T; then unresolved+='sshd Banner 조회 실패; '; continue; fi
+                banner=$(awk '$1=="banner"{print $2;exit}' <<<"$AUDIT_COMMAND_STDOUT")
+                record_value 'sshd -T' Banner "$banner"
+                local SSH_STATIC_VALUE='' SSH_HAS_MATCH=0 SSH_CONFIG_ERROR=''
+                local -A SSH_VISITED=()
+                ssh_read_config /etc/ssh/sshd_config
+                if ((SSH_HAS_MATCH)) || [[ -n $SSH_CONFIG_ERROR ]]; then unresolved+='SSH Match/Include 조건별 Banner 확인 필요; '; continue; fi
+                if [[ -z $banner || $banner == none ]]; then
+                    emit_result VULNERABLE '실행 중 SSH에 로그인 전 경고 Banner가 설정되지 않음' "Banner:${banner:-미설정}"; return
+                fi
+                rc=0; banner_matches "$banner" || rc=$?
+                if ((rc == 1)); then emit_result VULNERABLE 'SSH가 사용하는 Banner에 승인 문구 미충족' "Banner:$banner"; return
+                elif ((rc)); then unresolved+="SSH Banner 읽기 실패:$banner; "; fi
+                ;;
+            UNKNOWN) unresolved+='SSH 실행 상태 미확인; ' ;;
+        esac
+    done
+    if [[ -n $unresolved ]]; then emit_result MANUAL '파일 문구는 확인했으나 서비스 적용 범위 확인 필요' "$unresolved"
+    else emit_result GOOD '승인 경고 문구와 확인한 로그인 경로의 Banner 설정 충족' "issue:$local_match issue.net:$net_match SSH_Banner:${banner:-비실행}"; fi
 }
 
 check_u_63() {
@@ -2426,7 +2514,7 @@ check_u_66() {
     if [[ -d $real ]]; then
         local records="$AUDIT_WORK_DIR/logger.$BASHPID"
         if ! collect_paths "$records" "$real" -maxdepth 2 -type f -size +0c -print0; then
-            emit_result ERROR 'Log 파일 탐색 실패' "$evidence" '' INCOMPLETE_SCAN
+            emit_result ERROR 'Log 파일 탐색 실패' "$evidence" '' FIND_FAILED
             return
         fi
         while IFS= read -r -d '' file; do
@@ -2449,10 +2537,19 @@ check_u_66() {
 }
 
 check_u_67() {
+    require_accounts || return
     [[ -d /var/log ]] || { record_value /var/log directory no MISSING; emit_result ERROR '/var/log 없음' '' '' PATH_FAILED; return; }
+    local owners=0 name
     local -A rules=([checked]=0 [errors]=0 [bad]='')
-    file_rule_scan /var/log 0644 0 rules
-    file_rule_result 'Log 파일' rules GOOD MANUAL 'syslog 등 OS 기본 소유권도 자동 면제하지 않음; 디렉터리·Symlink·다른 로그 경로·journald는 별도 확인' emit_result INCOMPLETE_SCAN
+    record_value policy approved_log_accounts "${AUDIT_CONFIG[approved_log_accounts]}"
+    while IFS= read -r name; do
+        [[ -n $name ]] || continue
+        if [[ -v AUDIT_ACCOUNT_UID[$name] ]]; then owners+=",${AUDIT_ACCOUNT_UID[$name]}"
+        else rules[manual]=1; record_value policy "$name" '승인 계정 UID 확인 실패' MISSING; fi
+    done <<<"${AUDIT_CONFIG[approved_log_accounts]//,/$'\n'}"
+    record_value criterion log_permissions 'mode&0002=0; UID 0 또는 명시 승인한 계정. UID 1~999라는 이유만으로 자동 승인하지 않음'
+    file_rule_scan /var/log 7775 "$owners" rules
+    file_rule_result 'Log 파일' rules GOOD MANUAL '0660 등 그룹 쓰기는 허용; 추가 소유자는 approved_log_accounts에 명시' emit_result FIND_FAILED
 }
 
 # --- 결과 출력 — 민감값 제거 후 기록 ---
@@ -2620,6 +2717,8 @@ audit_main() {
         case $arg in
         --help | -h)
             audit_log '사용법: bash ciip_linux_2026.sh [--set key=value] [--show-config] [--validate-config]'
+            audit_log '외부 실행 제한 예: sudo nice -n 19 ionice -c3 timeout 3600 bash ciip_linux_2026.sh'
+            audit_log '일괄 파일 점검은 GNU find의 -printf가 필요하며, 미지원 시 해당 항목에 기록합니다.'
             show_config
             return 0
             ;;
@@ -2637,17 +2736,8 @@ audit_main() {
         *) abort_run "알 수 없는 인자: $arg" ;;
         esac
     done
-    for key in command_timeout_seconds scan_timeout_seconds scan_max_entries; do
-        value=${AUDIT_CONFIG[$key]}
-        case $key in
-        command_timeout_seconds) i=3600 ;;
-        scan_timeout_seconds) i=86400 ;;
-        scan_max_entries) i=10000000 ;;
-        esac
-        if [[ ! $value =~ ^[1-9][0-9]{0,7}$ ]] || ((value > i)); then
-            abort_run "$key: 1~$i 사이 정수 필요"
-        fi
-    done
+    value=${AUDIT_CONFIG[command_timeout_seconds]}
+    [[ $value =~ ^[1-9][0-9]{0,3}$ ]] && ((value <= 3600)) || abort_run 'command_timeout_seconds: 1~3600 사이 정수 필요'
     [[ -n ${AUDIT_CONFIG[output_dir]} && ${AUDIT_CONFIG[output_dir]} != *$'\n'* ]] || abort_run '출력 경로 오류'
     load_catalog || abort_run '가이드 Catalog 오류'
     for ((i = 1; i <= 67; i++)); do
@@ -2665,13 +2755,14 @@ audit_main() {
     show_config
     ((preview_only)) && return 0
     readonly -A AUDIT_CONFIG
-    for key in awk sed stat find sort head date mktemp readlink grep cat rm mv wc chmod mkdir uname tr cut sleep; do
+    for key in awk sed stat find sort head date mktemp readlink grep cat rm mv wc chmod mkdir uname tr cut; do
         command -v "$key" >/dev/null 2>&1 || abort_run "필수 도구 없음: $key"
     done
     if ((EUID != 0)); then audit_log '주의: root가 아니며 일부 항목은 ERROR가 될 수 있습니다.'; fi
     [[ $(uname -s) == Linux ]] || abort_run 'Linux Kernel이 필요합니다.'
     mkdir -p -- "${AUDIT_CONFIG[output_dir]}" || return 2
-    AUDIT_OUTPUT_DIR=$(mktemp -d "${AUDIT_CONFIG[output_dir]%/}/audit.XXXXXXXX") || return 2
+    AUDIT_OUTPUT_BASE=$(cd -- "${AUDIT_CONFIG[output_dir]}" && pwd -P) || return 2
+    AUDIT_OUTPUT_DIR=$(mktemp -d "$AUDIT_OUTPUT_BASE/audit.XXXXXXXX") || return 2
     AUDIT_OUTPUT_DIR=$(cd -- "$AUDIT_OUTPUT_DIR" && pwd -P) || return 2
     chmod 700 -- "$AUDIT_OUTPUT_DIR" || return 2
     AUDIT_WORK_DIR=$(mktemp -d "$AUDIT_OUTPUT_DIR/.work.XXXXXXXX") || return 2
@@ -2699,7 +2790,7 @@ audit_main() {
             emit_result ERROR '점검 함수 없음' "$flag" '' MISSING_IMPLEMENTATION >"$result"
         else
             # Isolated Scope: an unexpected exception/exit affects one item.
-            (AUDIT_ITEM_DEADLINE=$((SECONDS + ${AUDIT_CONFIG[scan_timeout_seconds]})); "$flag") >"$result" 2>"$AUDIT_WORK_DIR/$id.err" || :
+            ("$flag") >"$result" 2>"$AUDIT_WORK_DIR/$id.err" || :
             count=$(wc -l <"$result")
             if [[ $count != 1 || $(head -c 6 "$result") != '{"id":' ]]; then
                 emit_result ERROR '항목 실행 중 결과 계약 위반 또는 예외' "$(redact_text "$(head -c 8192 "$AUDIT_WORK_DIR/$id.err")")" 'Runtime/Script 오류 확인' CHECK_FAILED >"$result"
